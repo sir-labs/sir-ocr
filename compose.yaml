@@ -1,0 +1,79 @@
+name: sir-ocr
+services:
+  api:
+    image: sir-ocr-api:${OCR_IMAGE_TAG:-latest}
+    build:
+      context: .
+      target: api
+    user: "${OCR_UID:-1000}:${OCR_GID:-1000}"
+    environment:
+      OCR_DATA_DIR: /data
+      OCR_PUBLIC_ORIGIN: ${OCR_PUBLIC_ORIGIN:-http://localhost:8000}
+      OCR_TRUSTED_PROXIES: ${OCR_TRUSTED_PROXIES:-}
+      OCR_DPI: ${OCR_DPI:-200}
+    volumes:
+      - ${OCR_DATA_DIR:-./data}:/data
+    ports:
+      - "127.0.0.1:${OCR_PORT:-8000}:8000"
+    init: true
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 128
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 10s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: '3'}
+  worker:
+    image: sir-ocr-worker:${OCR_IMAGE_TAG:-latest}
+    build:
+      context: .
+      target: worker
+    user: "${OCR_UID:-1000}:${OCR_GID:-1000}"
+    environment:
+      OCR_DATA_DIR: /data
+      PADDLE_PDX_CACHE_HOME: /cache/paddlex
+      HF_HOME: /cache/huggingface
+      OCR_IDLE_SECONDS: ${OCR_IDLE_SECONDS:-300}
+      OCR_GPU_FREE_MIB: ${OCR_GPU_FREE_MIB:-9216}
+      OCR_DPI: ${OCR_DPI:-200}
+      HOME: /cache/home
+    volumes:
+      - ${OCR_DATA_DIR:-./data}:/data
+      - ${OCR_MODEL_CACHE:-./cache/paddlex}:/cache/paddlex
+      - ${OCR_AUX_CACHE:-./cache/aux}:/cache
+    depends_on:
+      api:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: 2gb
+    mem_limit: 16g
+    cpus: 8
+    pids_limit: 512
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    healthcheck:
+      test: [CMD, python, -m, app.health]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: '3'}

@@ -1,0 +1,35 @@
+name: Test, build and deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: sir-ocr-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: [self-hosted, sir-labs]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify Docker and GPU
+        run: |
+          docker info >/dev/null
+          nvidia-smi --query-gpu=name,memory.total --format=csv
+      - name: Test
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sir-ocr-test-$GITHUB_RUN_ID"
+          "$RUNNER_TEMP/sir-ocr-test-$GITHUB_RUN_ID/bin/pip" install -r requirements-test.lock
+          "$RUNNER_TEMP/sir-ocr-test-$GITHUB_RUN_ID/bin/python" -m pytest -q
+      - name: Build before replacing running services
+        run: scripts/deploy.sh build
+      - name: Deploy and verify HTTPS health
+        run: scripts/deploy.sh deploy
+      - name: Prune dangling images
+        if: always()
+        run: |
+          flock --wait 600 /tmp/sir-deploy.lock docker image prune -f

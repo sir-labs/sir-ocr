@@ -1,0 +1,14 @@
+services:
+  api:
+    networks: [default, sir-net]
+    environment:
+      OCR_PUBLIC_ORIGIN: https://ocr.sir-labs.com
+    labels:
+      proxy.enable: 'true'
+      proxy.host: ocr.sir-labs.com
+      proxy.port: '8000'
+      proxy.max_body_size: '51m'
+networks:
+  sir-net:
+    name: sir-server_sir-net
+    external: true
