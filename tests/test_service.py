@@ -258,3 +258,47 @@ def test_https_redirect_trust_and_no_loop(client, monkeypatch):
         for value in ['{"scheme":"https"}', '{}', 'invalid', 'null']:
             assert proxy.get('/', headers={'CF-Visitor': value}, follow_redirects=False).status_code == 200
         assert proxy.get('/healthz', follow_redirects=False).status_code == 200
+
+
+def test_job_event_timeline_and_private_timing(client):
+    blob = pdf()
+    j = submit(client, blob).json()
+    process_job(result_row(j), FakeEngine())
+    result = client.get(f"/api/jobs/{j['id']}", headers=headers(j)).json()
+    codes = [e['code'] for e in result['events']]
+    assert codes == ['queued','job_start','running','rendering','recognizing','saving_page','page_done','packaging','completed']
+    assert [e['at'] for e in result['events']] == sorted(e['at'] for e in result['events'])
+    assert result['timing']['ocr_seconds'] == .01
+    assert result['timing']['active'] is False
+    assert result['timing']['stage_seconds'] is None
+    assert result['timing']['elapsed_seconds'] >= 0
+    assert result['timing']['processing_seconds'] is not None
+    assert all(e['page'] == 1 for e in result['events'] if e['code'] in ('rendering','recognizing','saving_page','page_done'))
+    assert j['token'] not in json.dumps(result)
+    assert 'Hello OCR' not in json.dumps(result)
+    assert client.get(f"/api/jobs/{j['id']}", headers={'Authorization':'Bearer wrong'}).status_code == 404
+    # Joining an identical document shares the actual processing history.
+    alias = submit(client, blob).json()
+    assert client.get(f"/api/jobs/{alias['id']}", headers=headers(alias)).json()['events'] == result['events']
+
+
+def test_events_recovery_bounded_and_legacy(client):
+    j = submit(client).json()
+    key = result_row(j)['key']
+    with db.connect(True) as c:
+        c.execute("UPDATE results SET state='running' WHERE key=?", (key,))
+    recover()
+    result = db.status(j['id'],j['token'])
+    assert result['state'] == 'queued'
+    assert result['events'][-1]['code'] == 'recovered'
+    with db.connect(True) as c:
+        for _ in range(205):
+            db.record_event(c,key,'recognizing',1)
+    result = db.status(j['id'],j['token'])
+    assert len(result['events']) == 200
+    assert result['timing']['active'] and result['timing']['stage_seconds'] >= 0
+    with db.connect(True) as c:
+        c.execute('DELETE FROM events WHERE result_key=?',(key,))
+    db.init()  # Existing databases remain usable and migration is idempotent.
+    result = db.status(j['id'],j['token'])
+    assert result['events'] == [] and result['stage'] is None

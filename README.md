@@ -75,3 +75,9 @@ uv venv --python 3.12
 uv pip install -r requirements-test.lock
 .venv/bin/python -m pytest -q
 ```
+
+### Processing activity in the browser
+
+The job page shows the current processing step, elapsed wall time since admission, time in the current step, and accumulated OCR time for completed pages. A persistent, token-protected timeline records queue admission, worker starts/recovery, GPU wait, model preparation, PDF rendering, recognition, page saving, retries and ZIP packaging. The browser polls every two seconds and updates elapsed clocks every second; it does not estimate token progress or completion percentages within a page. The latest 200 events are shown, with timestamps in the browser's timezone. Per-page OCR times remain visible after completion.
+
+Events are stored in SQLite alongside each shared result, contain no document text or tokens, and survive deployments. Identical-document subscriptions share the same processing history. Existing jobs have no historical stage events before this feature was deployed; their saved per-page timings remain available.

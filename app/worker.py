@@ -80,6 +80,7 @@ class Engine:
         self.process.start()
         remote.close()
         self.receive(1800)
+        db.event(key,'model_ready')
         self.last_use=time.monotonic()
     def predict(self,source,staging):
         self.connection.send({'source':str(source),'staging':str(staging)})
@@ -97,6 +98,7 @@ def gpu_free():
 def state(key,value,error=None):
     with db.connect(True) as c:
         c.execute('UPDATE results SET state=?,error=?,updated=? WHERE key=?',(value,error,time.time(),key))
+        db.record_event(c,key,value)
 
 def heartbeat():
     while not STOP.is_set():
@@ -110,12 +112,17 @@ def heartbeat():
 def recover():
     # Exclusive flock is held for the worker lifetime. No live peer can own these jobs.
     with db.connect(True) as c:
+        for row in c.execute("SELECT key FROM results WHERE state IN ('waiting_gpu','preparing_model','running','packaging')").fetchall():
+            db.record_event(c,row['key'],'recovered')
         c.execute(f"UPDATE results SET state='queued',error=NULL WHERE state IN ({db.PLACEHOLDERS})",db.ACTIVE)
         c.execute("UPDATE pages SET state='pending' WHERE state='running'")
     log.info('recovered_interrupted_jobs')
 
 def complete_page(key,n,meta):
     with db.connect(True) as c:
+        previous = c.execute("SELECT state FROM pages WHERE result_key=? AND number=?",(key,n)).fetchone()
+        if previous and previous[0] != 'done':
+            db.record_event(c,key,'page_done',n,meta['seconds'])
         c.execute("UPDATE pages SET state='done',seconds=?,error=NULL WHERE result_key=? AND number=?",(meta['seconds'],key,n))
         c.execute('UPDATE results SET model_hashes=?,updated=? WHERE key=?',(json.dumps(meta['model_hashes'],sort_keys=True),time.time(),key))
 
@@ -128,6 +135,7 @@ def process_job(row,engine):
         state(key,'failed','configuration_changed: restore the original worker configuration to retry')
         return
     log.info('job_start key=%s pages=%s',key[:12],row['page_count'])
+    db.event(key,'job_start')
     for n in range(1,row['page_count']+1):
         if STOP.is_set():
             raise InterruptedError()
@@ -146,10 +154,13 @@ def process_job(row,engine):
                 if staging.exists():
                     shutil.rmtree(staging)
                 staging.mkdir()
+                db.event(key,'rendering',n)
                 source=staging/'source.png'
                 with fitz.open(base/'source.pdf') as pdf:
                     pdf[n-1].get_pixmap(dpi=cfg.CONFIG['dpi']).save(source)
+                db.event(key,'recognizing',n)
                 response=engine.predict(source,staging)
+                db.event(key,'saving_page',n)
                 if final.exists():
                     shutil.rmtree(final)
                 os.replace(staging,final)
@@ -167,9 +178,11 @@ def process_job(row,engine):
                 engine.close()
                 error=str(e) if isinstance(e,InferenceFailure) else 'storage_or_render_error'
                 if error=='gpu_out_of_memory' and attempt==0:
+                    db.event(key,'oom_retry',n)
                     log.warning('oom_retry key=%s page=%s',key[:12],n)
                     continue
                 with db.connect(True) as c:
+                    db.record_event(c,key,'page_failed',n)
                     c.execute("UPDATE pages SET state='failed',error=? WHERE result_key=? AND number=?",(error,key,n))
                 log.error('page_failed key=%s page=%s code=%s',key[:12],n,error)
                 break

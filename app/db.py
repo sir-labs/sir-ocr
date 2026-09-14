@@ -48,10 +48,23 @@ def init():
             result_key TEXT NOT NULL REFERENCES results(key), number INTEGER NOT NULL,
             state TEXT NOT NULL, seconds REAL, error TEXT, attempts INTEGER DEFAULT 0,
             PRIMARY KEY(result_key, number));
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            result_key TEXT NOT NULL REFERENCES results(key) ON DELETE CASCADE,
+            at REAL NOT NULL, code TEXT NOT NULL, page INTEGER, seconds REAL);
+        CREATE INDEX IF NOT EXISTS events_result ON events(result_key,id);
         CREATE TABLE IF NOT EXISTS requests (ip TEXT NOT NULL, at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS requests_at ON requests(at);
         CREATE TABLE IF NOT EXISTS worker (id INTEGER PRIMARY KEY CHECK(id=1), heartbeat REAL NOT NULL);
         ''')
+
+def record_event(c, key, code, page=None, seconds=None):
+    c.execute('INSERT INTO events(result_key,at,code,page,seconds) VALUES (?,?,?,?,?)',
+              (key, time.time(), code, page, seconds))
+
+def event(key, code, page=None, seconds=None):
+    with connect(True) as c:
+        record_event(c, key, code, page, seconds)
 
 def free_space():
     if shutil.disk_usage(cfg.DATA).free < cfg.MIN_FREE:
@@ -96,6 +109,7 @@ def register(path, pdf_hash, page_count, ip):
                       (key, pdf_hash, cfg.CONFIG_JSON, page_count, 'queued', now, now, None, None))
             c.executemany('INSERT INTO pages(result_key,number,state) VALUES (?,?,?)',
                           [(key, n, 'pending') for n in range(1, page_count+1)])
+            record_event(c, key, 'queued')
         elif r['state'] in ACTIVE:
             # Joining an existing GPU job does not consume global capacity, but does consume IP capacity.
             count = c.execute(f'''SELECT count(DISTINCT r.key) FROM jobs j JOIN results r ON r.key=j.result_key
@@ -120,8 +134,23 @@ def status(ident, token):
         pages = [dict(p) for p in c.execute('SELECT number,state,seconds,error,attempts FROM pages WHERE result_key=? ORDER BY number', (j['result_key'],))]
         ahead = c.execute(f'''SELECT count(*) FROM results WHERE state IN ({PLACEHOLDERS})
             AND (created < ? OR (created = ? AND key < ?))''', (*ACTIVE, r['created'], r['created'], r['key'])).fetchone()[0]
+        events = [dict(e) for e in c.execute(
+            'SELECT id,at,code,page,seconds FROM events WHERE result_key=? ORDER BY id DESC LIMIT 200',
+            (j['result_key'],))][::-1]
+        first = c.execute("SELECT min(at) FROM events WHERE result_key=? AND code='queued'", (j['result_key'],)).fetchone()[0]
+        started = c.execute("SELECT min(at) FROM events WHERE result_key=? AND code='job_start'", (j['result_key'],)).fetchone()[0]
         heartbeat = c.execute('SELECT heartbeat FROM worker WHERE id=1').fetchone()
-    return {'id': ident, 'state': r['state'], 'page_count': r['page_count'],
+    now = time.time()
+    active = r['state'] in ACTIVE
+    end = now if active else r['updated']
+    stage = events[-1] if events else None
+    return {'events': events, 'stage': stage, 'timing': {
+                'active': active, 'server_time': now,
+                'elapsed_seconds': max(0, end-(first or r['created'])),
+                'processing_seconds': max(0, end-started) if started else None,
+                'ocr_seconds': sum(p['seconds'] or 0 for p in pages),
+                'stage_seconds': max(0, end-stage['at']) if stage and active else None,
+            }, 'id': ident, 'state': r['state'], 'page_count': r['page_count'],
             'completed_pages': sum(p['state']=='done' for p in pages), 'pages': pages,
             'queue_position': ahead+1 if r['state']=='queued' else None,
             'error': r['error'], 'worker_online': bool(heartbeat and time.time()-heartbeat[0]<30)}
@@ -139,3 +168,4 @@ def retry(ident, token, ip):
             check_capacity(c, owner[0], r['key'])
         c.execute("UPDATE pages SET state='pending', error=NULL WHERE result_key=? AND state!='done'", (r['key'],))
         c.execute("UPDATE results SET state='queued',error=NULL,created=?,updated=? WHERE key=?", (time.time(),time.time(),r['key']))
+        record_event(c, r['key'], 'queued')
