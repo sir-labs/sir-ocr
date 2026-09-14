@@ -4,7 +4,7 @@ Verified on the actual RTX 5070 host, with generated test PDFs only. Historical 
 
 | Check | Evidence |
 | --- | --- |
-| Automated API/queue/artifact tests | 16 passed, including concurrent deduplication, changed configuration, bad tokens, admission/rate limits, low-space simulation, chunked-size limit, page recovery, OOM retry and validation timeout |
+| Automated API/queue/artifact tests | 17 passed, including concurrent deduplication, changed configuration, bad tokens, admission/rate limits, low-space simulation, chunked-size limit, page recovery, OOM retry, validation timeout and job-scoped native-download authorization |
 | GPU container | Paddle GPU 3.2.1, CUDA runtime 12.9, RTX 5070; tensor computation returns 14.0 |
 | Actual OOM | A test-only 32 GiB allocation raises `MemoryError`, correctly classified as `gpu_out_of_memory`; retry transitions are tested with fault injection |
 | Existing model cache | Full 3-page pipeline succeeds; page times 3.30 / 2.31 / 2.29 seconds |
@@ -18,7 +18,7 @@ Verified on the actual RTX 5070 host, with generated test PDFs only. Historical 
 | Live negative inputs | Invalid PDF 400, encrypted PDF 400, 501 pages 400, 50 MiB + 1 byte 413, wrong token 404 |
 | Proxy spoofing | Arbitrary `X-Forwarded-For` is not accepted as the client IP; a spoofed duplicate still reuses existing output |
 | Repository/image contents | No user PDFs or model weights tracked; GPU image inspected for model-weight files and application PDFs: none |
-| Browser status/copy | HTTPS UI shows 3/3 completed and the copy-link action succeeds |
+| Browser upload/download | Chrome selects a fresh 2-page PDF through the real file chooser, uploads it, shows 2/2 completed, and emits the native ZIP download event after clicking the download link; copy-link also succeeds |
 
 ZIP checks cover archive CRC, PDF SHA-256, page order, every referenced image, all per-page JSON files, matching output for duplicate subscriptions and rejection of cross-job tokens. Export version 2 trims recognized inline-math whitespace, preserves code/currency and raw OCR, and participates in the result key. OCR text itself can still contain recognition errors; this is functional acceptance, not an accuracy benchmark.
 
@@ -29,6 +29,7 @@ The service stores production data outside the Actions checkout. Container inspe
 - Gateway: [`sir-server` b10de81](https://github.com/sir-labs/sir-server/commit/b10de81), [successful Actions run 34805852096](https://github.com/sir-labs/sir-server/actions/runs/34805852096). Enables `proxy.max_body_size`; only OCR uses `51m`.
 - Initial service: [successful Actions run 34806753028](https://github.com/sir-labs/sir-ocr/actions/runs/34806753028).
 - Export version 2: [successful Actions run 34806972224](https://github.com/sir-labs/sir-ocr/actions/runs/34806972224).
+- Native browser download: [successful Actions run 34807981411](https://github.com/sir-labs/sir-ocr/actions/runs/34807981411). Downloads stream directly using a job-path-scoped Secure/HttpOnly/SameSite cookie issued only after bearer authorization.
 - Runner actually reports name `sir-labs`, labels `[self-hosted, sir-labs]`.
 - Both API/worker healthchecks and public HTTPS health passed. Workflow only runs on `main` pushes or manual dispatch, never pull requests.
 
@@ -43,4 +44,4 @@ python -m scripts.smoke --url https://ocr.sir-labs.com --pdf /tmp/acceptance.pdf
 
 Use `scripts/restart_check.py` only with explicitly named `sir-ocr-preflight-*` containers and separate test storage. Override the inherited `com.docker.compose.project` image label on test containers so production Compose does not discover them. Queue-full, low-disk and OOM retry transitions use controlled tests rather than filling production storage or deliberately crashing production OCR.
 
-Browser file selection and native download confirmation are being completed after the user enabled the Chrome extension's file-URL permission. Public HTTPS API download and ZIP integrity are already verified. The browser tool blocks `chrome://downloads`, so download history is not used as evidence.
+Browser file selection succeeded after the user enabled the Chrome extension's file-URL permission. Native download is confirmed by the browser download event; archive contents and integrity were independently verified through the HTTPS API. Download history is not used as evidence.
