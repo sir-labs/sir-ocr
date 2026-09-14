@@ -21,6 +21,12 @@ nginx_ip=$(docker inspect sir-nginx --format '{{(index .NetworkSettings.Networks
 tunnel_ip=$(docker inspect cloudflared --format '{{(index .NetworkSettings.Networks "sir-server_sir-net").IPAddress}}')
 [[ -n "$nginx_ip" && -n "$tunnel_ip" ]]
 export OCR_TRUSTED_PROXIES="$nginx_ip/32,$tunnel_ip/32"
+# sir-mcp forwards uploads with the client's X-Forwarded-For; trust it so limits stay per real client.
+# ponytail: IP is read at deploy time; after sir-mcp is recreated, redeploy sir-ocr (until then MCP uploads share one limit).
+mcp_ip=$(docker inspect sir-mcp-mcp-1 --format '{{(index .NetworkSettings.Networks "sir-server_sir-net").IPAddress}}' 2>/dev/null || true)
+if [[ -n "$mcp_ip" ]]; then
+  OCR_TRUSTED_PROXIES+=",$mcp_ip/32"
+fi
 compose=(docker compose -f compose.yaml -f compose.sir.yaml)
 "${compose[@]}" config --quiet
 case "${1:-deploy}" in
