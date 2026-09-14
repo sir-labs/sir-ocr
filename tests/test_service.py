@@ -224,3 +224,19 @@ def test_validation_timeout_keeps_api_healthy(client, monkeypatch):
         assert submit(client).status_code == 400
     assert client.get('/healthz').status_code == 200
     assert submit(client).status_code == 201
+
+
+def test_native_download_cookie_is_job_scoped(client):
+    j = submit(client).json()
+    process_job(result_row(j), FakeEngine())
+    url = f"/api/jobs/{j['id']}"
+    assert client.get(url + '/download').status_code == 404
+    response = client.get(url, headers=headers(j))
+    cookie = response.headers['set-cookie']
+    assert 'HttpOnly' in cookie and 'SameSite=strict' in cookie
+    assert f'Path={url}/download' in cookie
+    assert client.get(url + '/download').status_code == 200
+    assert client.get(url).status_code == 404
+    assert client.get(url + '/download', headers={'Authorization':'Bearer wrong'}).status_code == 404
+    other = submit(client, pdf('different')).json()
+    assert client.get(f"/api/jobs/{other['id']}/download").status_code == 404

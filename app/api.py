@@ -9,7 +9,7 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -141,8 +141,17 @@ async def create_job(request: Request):
             path.unlink(missing_ok=True)
 
 @app.get('/api/jobs/{ident}')
-def get_job(ident: str, request: Request):
-    return db.status(ident,bearer(request))
+def get_job(ident: str, request: Request, response: Response):
+    token = bearer(request)
+    result = db.status(ident, token)
+    # Native file downloads cannot add an Authorization header. Grant only this
+    # job's download path a Secure/HttpOnly capability after bearer verification.
+    response.set_cookie(
+        'ocr_download', token, max_age=86400,
+        path=f'/api/jobs/{ident}/download', httponly=True, samesite='strict',
+        secure=os.getenv('OCR_PUBLIC_ORIGIN', '').startswith('https://'),
+    )
+    return result
 
 @app.post('/api/jobs/{ident}/retry')
 def retry_job(ident: str, request: Request):
@@ -152,7 +161,8 @@ def retry_job(ident: str, request: Request):
 @app.get('/api/jobs/{ident}/download')
 def download(ident: str, request: Request):
     with db.connect() as c:
-        j = db.authorize(c,ident,bearer(request))
+        token = bearer(request) if request.headers.get('authorization') else request.cookies.get('ocr_download', '')
+        j = db.authorize(c,ident,token)
         r = c.execute('SELECT state FROM results WHERE key=?',(j['result_key'],)).fetchone()
         if r['state'] != 'completed':
             raise HTTPException(409,'All pages must succeed before downloading.')
