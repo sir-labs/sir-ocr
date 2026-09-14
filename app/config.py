@@ -19,7 +19,7 @@ CONFIG = {
     'max_new_tokens': 4096, 'use_doc_orientation_classify': False,
     'use_doc_unwarping': False, 'use_ocr_for_image_block': True,
     'use_chart_recognition': False, 'use_queues': False,
-    'export_version': 1,
+    'export_version': 2,
 }
 CONFIG_JSON = json.dumps(CONFIG, sort_keys=True, separators=(',', ':'))
 

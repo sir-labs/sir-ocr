@@ -34,6 +34,12 @@ def normalize_math(text):
     for i in range(0,len(parts),2):
         parts[i] = re.sub(r'\\\[([\s\S]*?)\\\]',lambda m:'\n\n$$\n'+m[1].strip()+'\n$$\n\n',parts[i])
         parts[i] = re.sub(r'\\\((.*?)\\\)',lambda m:'$'+m[1].strip()+'$',parts[i],flags=re.S)
+        def trim_inline(match):
+            body = match[1]
+            if any(symbol in body for symbol in ('\\', '=', '^', '_', '+', '*', '/', '<', '>')) or re.fullmatch(r'\s*[A-Za-z0-9]\s*', body):
+                return '$' + body.strip() + '$'
+            return match[0]
+        parts[i] = re.sub(r'(?<!\$)\$(?!\$)([^$\n]+)\$(?!\$)', trim_inline, parts[i])
     return ''.join(parts)
 
 def validate_images(text, base):

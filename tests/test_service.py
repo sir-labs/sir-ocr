@@ -207,3 +207,8 @@ def test_worker_exclusive_lock(client):
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         run=subprocess.run([sys.executable,'-m','app.worker'],env={**os.environ,'OCR_DATA_DIR':str(cfg.DATA)},capture_output=True,text=True,timeout=10)
     assert run.returncode!=0 and 'Only one worker' in run.stderr
+
+
+def test_inline_math_whitespace_preserves_currency_and_code():
+    text = r'Formula: $ x^2 = y $; `$ x $`; price $ 5 and $ 10.'
+    assert normalize_math(text) == r'Formula: $x^2 = y$; `$ x $`; price $ 5 and $ 10.'
