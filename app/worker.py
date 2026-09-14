@@ -17,6 +17,8 @@ from .inference import child
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 log=logging.getLogger('worker')
 STOP=threading.Event()
+fitz.TOOLS.mupdf_display_errors(False)
+fitz.TOOLS.mupdf_display_warnings(False)
 
 class InferenceFailure(Exception):
     pass

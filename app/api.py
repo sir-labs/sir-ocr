@@ -1,3 +1,7 @@
+import json
+import asyncio
+import subprocess
+import sys
 import hashlib
 import ipaddress
 import os
@@ -5,7 +9,6 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
-import pymupdf as fitz
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +20,7 @@ STATIC = Path(__file__).parent / 'static'
 @asynccontextmanager
 async def lifespan(app):
     db.init()
+    app.state.validation_slots = asyncio.Semaphore(2)
     yield
 
 app = FastAPI(title='SIR OCR', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -93,24 +97,16 @@ def bearer(request):
 
 def validate(path):
     try:
-        with path.open('rb') as f:
-            if not f.read(1024).lstrip().startswith(b'%PDF-'):
-                raise ValueError('Not a PDF.')
-        with fitz.open(path) as pdf:
-            if pdf.needs_pass or pdf.is_encrypted:
-                raise ValueError('Password-protected PDFs are not accepted.')
-            if pdf.is_repaired:
-                raise ValueError('PDF is damaged. Please export a valid PDF.')
-            if not 1 <= len(pdf) <= cfg.MAX_PAGES:
-                raise ValueError('PDF must contain 1–500 pages.')
-            for page in pdf:
-                if page.rect.width <= 0 or page.rect.height <= 0:
-                    raise ValueError('Invalid page dimensions.')
-                if page.rect.width * page.rect.height * (cfg.CONFIG['dpi']/72)**2 > 40_000_000:
-                    raise ValueError('A page exceeds the 40 megapixel render safety limit at 200 DPI.')
-            return len(pdf)
-    except (ValueError, RuntimeError, fitz.FileDataError) as e:
-        raise HTTPException(400, str(e))
+        result = subprocess.run(
+            [sys.executable, '-m', 'app.pdf_validation', str(path), str(cfg.MAX_PAGES), str(cfg.CONFIG['dpi'])],
+            capture_output=True, text=True, timeout=30,
+        )
+        response = json.loads(result.stdout)
+        if result.returncode or 'page_count' not in response:
+            raise HTTPException(400, response.get('error', 'PDF validation failed.'))
+        return response['page_count']
+    except (subprocess.TimeoutExpired, json.JSONDecodeError):
+        raise HTTPException(400, 'PDF validation exceeded its time or memory limit.')
 
 @app.get('/healthz')
 def health():
@@ -137,7 +133,8 @@ async def create_job(request: Request):
                     f.write(chunk)
                 f.flush()
                 os.fsync(f.fileno())
-        count = await run_in_threadpool(validate,path)
+        async with app.state.validation_slots:
+            count = await run_in_threadpool(validate,path)
         return await run_in_threadpool(db.register,path,digest.hexdigest(),count,client_ip(request))
     finally:
         if path:

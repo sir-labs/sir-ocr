@@ -26,7 +26,7 @@ Pinned runtime: Python 3.12, Paddle GPU 3.2.1 / CUDA 12.9, PaddleOCR 3.7.0, Padd
 
 Use `Authorization: Bearer <token>` for all per-job endpoints. Tokens are hashed in SQLite. The browser stores capabilities locally; shared links put the token in the URL fragment, which is not sent to HTTP servers or proxy access logs. There is no public list or delete endpoint. API access logging is disabled; worker logs contain job-hash prefixes, page numbers, timing and error codes, never PDF text or tokens.
 
-Limits: 50 MiB, 500 pages, 2 unfinished distinct documents/IP, 20 unfinished GPU jobs globally, 10 create/retry requests/minute/IP. The 50 MiB limit is checked both while receiving the body and while reading the file. Damaged/encrypted PDFs are rejected. Pages above 40 megapixels at the configured DPI are rejected explicitly, rather than silently downsampled. New uploads and retries stop below 10 GiB free space. Existing originals/results remain until administrator deletion.
+Limits: 50 MiB, 500 pages, 2 unfinished distinct documents/IP, 20 unfinished GPU jobs globally, 10 create/retry requests/minute/IP. The 50 MiB limit is checked both while receiving the body and while reading the file. Damaged/encrypted PDFs are rejected. PDF validation runs in isolated processes (at most two concurrently), each bounded to 768 MiB address space, 20 CPU seconds and 30 seconds wall time, keeping MuPDF out of API threads. Pages above 40 megapixels at the configured DPI are rejected explicitly, rather than silently downsampled. New uploads and retries stop below 10 GiB free space. Existing originals/results remain until administrator deletion.
 
 ## Queue and recovery
 

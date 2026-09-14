@@ -212,3 +212,15 @@ def test_worker_exclusive_lock(client):
 def test_inline_math_whitespace_preserves_currency_and_code():
     text = r'Formula: $ x^2 = y $; `$ x $`; price $ 5 and $ 10.'
     assert normalize_math(text) == r'Formula: $x^2 = y$; `$ x $`; price $ 5 and $ 10.'
+
+
+def test_validation_timeout_keeps_api_healthy(client, monkeypatch):
+    import subprocess
+    from app import api
+    with monkeypatch.context() as patch:
+        def timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired('validator', 30)
+        patch.setattr(api.subprocess, 'run', timeout)
+        assert submit(client).status_code == 400
+    assert client.get('/healthz').status_code == 200
+    assert submit(client).status_code == 201
