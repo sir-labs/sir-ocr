@@ -9,12 +9,13 @@ import os
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from . import config as cfg, db
+from .artifacts import image_refs
 
 STATIC = Path(__file__).parent / 'static'
 
@@ -80,8 +81,10 @@ class LimitsMiddleware:
                     logging.getLogger('uvicorn.error').warning(
                         'origin_rejected origin_kind=%s', origin_kind)
                     raise HTTPException(403, 'Cross-origin requests are disabled.')
-                await run_in_threadpool(db.rate_limit, client_ip(request))
-                await run_in_threadpool(db.free_space)
+                # Cancellation must remain available during low disk or admission throttling.
+                if not scope['path'].endswith('/cancel'):
+                    await run_in_threadpool(db.rate_limit, client_ip(request))
+                    await run_in_threadpool(db.free_space)
                 try:
                     length = int(request.headers.get('content-length', '0'))
                 except ValueError:
@@ -100,7 +103,7 @@ class LimitsMiddleware:
                 if message['type']=='http.response.start':
                     message['headers'] += [(b'cache-control',b'no-store'),(b'referrer-policy',b'strict-origin'),
                         (b'x-content-type-options',b'nosniff'),
-                        (b'content-security-policy',b"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")]
+                        (b'content-security-policy',b"default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")]
                 await send(message)
             await self.app(scope, limited_receive, safe_send)
         except BodyTooLarge:
@@ -170,6 +173,8 @@ def get_job(ident: str, request: Request, response: Response):
         path=f'/api/jobs/{ident}/download', httponly=True, samesite='strict',
         secure=os.getenv('OCR_PUBLIC_ORIGIN', '').startswith('https://'),
     )
+    response.set_cookie('ocr_preview', token, max_age=86400, path=f'/api/jobs/{ident}/preview',
+                        httponly=True, samesite='strict', secure=os.getenv('OCR_PUBLIC_ORIGIN','').startswith('https://'))
     return result
 
 @app.post('/api/jobs/{ident}/retry')
@@ -187,6 +192,47 @@ def download(ident: str, request: Request):
             raise HTTPException(409,'All pages must succeed before downloading.')
         path = cfg.DATA/'results'/j['result_key']/'result.zip'
     return FileResponse(path,media_type='application/zip',filename='ocr-result.zip')
+
+@app.post('/api/jobs/{ident}/cancel')
+def cancel_job(ident: str, request: Request):
+    db.cancel(ident,bearer(request))
+    return db.status(ident,bearer(request))
+
+def preview_page(ident, number, token):
+    with db.connect() as c:
+        j = db.authorize(c,ident,token)
+        page = c.execute('SELECT state FROM pages WHERE result_key=? AND number=?',(j['result_key'],number)).fetchone()
+        if not page:
+            raise HTTPException(404,'Page not found.')
+        if page['state'] != 'done':
+            raise HTTPException(409,'This page is not finished yet.')
+        base = cfg.DATA/'results'/j['result_key']/'pages'/f'{number:04d}'
+    markdown = (base/'page.md').read_text()
+    images = {}
+    for ref in image_refs(markdown):
+        path = (base/unquote(ref)).resolve()
+        if path.is_relative_to(base.resolve()) and path.is_file() and path.suffix.lower() in ('.png','.jpg','.jpeg','.webp','.gif'):
+            images[hashlib.sha256(ref.encode()).hexdigest()] = (ref,path)
+    return markdown,images
+
+@app.get('/api/jobs/{ident}/preview/pages/{number}')
+def read_page(ident: str, number: int, request: Request):
+    markdown, images = preview_page(ident,number,bearer(request))
+    return {'number':number,'markdown':markdown,'images':{
+        ref:f'/api/jobs/{ident}/preview/pages/{number}/images/{key}'
+        for key,(ref,path) in images.items()}}
+
+@app.get('/api/jobs/{ident}/preview/pages/{number}/images/{image_id}')
+def read_image(ident: str, number: int, image_id: str, request: Request):
+    token = bearer(request) if request.headers.get('authorization') else request.cookies.get('ocr_preview','')
+    _,images = preview_page(ident,number,token)
+    if image_id not in images:
+        raise HTTPException(404,'Image not found.')
+    return FileResponse(images[image_id][1])
+
+@app.get('/view')
+def viewer():
+    return FileResponse(STATIC/'viewer.html')
 
 @app.get('/')
 def index():

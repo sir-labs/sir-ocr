@@ -302,3 +302,101 @@ def test_events_recovery_bounded_and_legacy(client):
     db.init()  # Existing databases remain usable and migration is idempotent.
     result = db.status(j['id'],j['token'])
     assert result['events'] == [] and result['stage'] is None
+
+
+def test_cancel_queued_private_idempotent_and_low_disk(client, monkeypatch):
+    j=submit(client).json();url=f"/api/jobs/{j['id']}/cancel"
+    assert client.post(url,headers={'Authorization':'Bearer wrong'}).status_code==404
+    monkeypatch.setattr(db,'free_space',lambda: (_ for _ in ()).throw(HTTPException(507,'full')))
+    monkeypatch.setattr(db,'rate_limit',lambda ip: (_ for _ in ()).throw(HTTPException(429,'busy')))
+    assert client.post(url,headers=headers(j)).json()['state']=='cancelled'
+    assert client.post(url,headers=headers(j)).status_code==200
+    engine=FakeEngine();process_job(result_row(j),engine)
+    assert engine.calls==[]
+    assert db.status(j['id'],j['token'])['state']=='cancelled'
+
+
+def test_cancel_shared_job_does_not_stop_other_subscriber(client):
+    blob=pdf();a=submit(client,blob).json();b=submit(client,blob).json()
+    db.cancel(a['id'],a['token'])
+    assert db.status(a['id'],a['token'])['state']=='cancelled'
+    assert db.status(b['id'],b['token'])['state']=='queued'
+    process_job(result_row(b),FakeEngine())
+    assert db.status(b['id'],b['token'])['state']=='completed'
+    assert db.status(a['id'],a['token'])['state']=='cancelled'
+
+
+def test_cancel_running_keeps_pages_and_reupload_resumes(client):
+    blob=pdf(pages=2);j=submit(client,blob).json()
+    class CancellingEngine(FakeEngine):
+        def predict(self,source,staging):
+            result=super().predict(source,staging)
+            if len(self.calls)==2:db.cancel(j['id'],j['token'])
+            return result
+    engine=CancellingEngine();process_job(result_row(j),engine)
+    result=db.status(j['id'],j['token'])
+    assert result['state']=='cancelled' and result['completed_pages']==1
+    assert engine.closed==1
+    again=submit(client,blob).json();engine=FakeEngine()
+    process_job(result_row(again),engine)
+    assert engine.calls==[2]
+    assert db.status(again['id'],again['token'])['state']=='completed'
+    assert db.status(j['id'],j['token'])['state']=='cancelled'
+
+
+def test_cancellation_survives_restart_and_interrupts_receive(client):
+    from app.worker import Engine,state
+    j=submit(client).json();key=result_row(j)['key']
+    state(key,'preparing_model');db.cancel(j['id'],j['token'])
+    assert db.status(j['id'],j['token'])['state']=='cancelling'
+    engine=Engine();engine.key=key
+    with pytest.raises(db.JobCancelled):engine.receive(600)
+    recover()
+    assert db.status(j['id'],j['token'])['state']=='cancelled'
+    assert result_row(j)['state']=='cancelled'
+
+
+def test_preview_auth_images_and_unfinished_page(client):
+    j=submit(client).json();url=f"/api/jobs/{j['id']}/preview/pages/1"
+    assert client.get(url,headers=headers(j)).status_code==409
+    process_job(result_row(j),FakeEngine())
+    assert client.get(url).status_code==404
+    response=client.get(url,headers=headers(j))
+    assert response.status_code==200 and 'Page 1' in response.json()['markdown']
+    image=next(iter(response.json()['images'].values()))
+    assert client.get(image).status_code==404
+    client.get(f"/api/jobs/{j['id']}",headers=headers(j))
+    assert client.get(image).status_code==200
+    assert client.get(image,headers={'Authorization':'Bearer wrong'}).status_code==404
+    assert client.get(url+'/images/../../source.pdf',headers=headers(j)).status_code in (404,422)
+    assert client.get(f"/api/jobs/{j['id']}/preview/pages/2",headers=headers(j)).status_code==404
+    assert client.post(f"/api/jobs/{j['id']}/cancel",headers=headers(j)).status_code==409
+
+
+def test_preview_rejects_paths_and_active_images(client):
+    j=submit(client).json();process_job(result_row(j),FakeEngine())
+    base=cfg.DATA/'results'/result_row(j)['key']/'pages/0001'
+    (base/'evil.svg').write_text('<svg onload="alert(1)"/>')
+    (base/'page.md').write_text('![bad](../../source.pdf) ![svg](evil.svg) ![external](https://evil.example/pixel.png)')
+    assert client.get(f"/api/jobs/{j['id']}/preview/pages/1",headers=headers(j)).json()['images']=={}
+
+
+def test_running_cancel_terminates_inference_subprocess(client):
+    import multiprocessing as mp
+    import threading
+    from app.worker import Engine,state
+    j=submit(client).json();key=result_row(j)['key'];state(key,'running')
+    engine=Engine();engine.key=key
+    ctx=mp.get_context('spawn');parent,remote=ctx.Pipe()
+    engine.connection=parent
+    engine.process=ctx.Process(target=time.sleep,args=(60,));engine.process.start()
+    pid=engine.process.pid
+    trigger=threading.Timer(.1,lambda:db.cancel(j['id'],j['token']));trigger.start()
+    start=time.monotonic()
+    try:
+        with pytest.raises(db.JobCancelled):engine.receive(600)
+    finally:
+        engine.close();remote.close();trigger.join()
+    assert time.monotonic()-start < 5
+    assert engine.process is None
+    assert pid not in [p.pid for p in mp.active_children()]

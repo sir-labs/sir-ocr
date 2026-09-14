@@ -26,6 +26,7 @@ class InferenceFailure(Exception):
 class Engine:
     def __init__(self):
         self.process=None
+        self.key=None
         self.connection=None
         self.last_use=time.monotonic()
     def close(self):
@@ -45,6 +46,8 @@ class Engine:
     def receive(self,timeout):
         deadline=time.monotonic()+timeout
         while not STOP.is_set():
+            if self.key:
+                db.check_cancelled(self.key)
             if self.connection.poll(1):
                 try:
                     response=self.connection.recv()
@@ -60,12 +63,15 @@ class Engine:
                 raise InferenceFailure('inference_timeout')
         raise InterruptedError()
     def ensure(self,key):
+        self.key=key
+        db.check_cancelled(key)
         if self.process and self.process.is_alive():
             return
         self.close()
         state(key,'waiting_gpu')
         log.info('waiting_gpu minimum_free_mib=%s',cfg.GPU_FREE_MIB)
         while not STOP.is_set():
+            db.check_cancelled(key)
             if gpu_free()>=cfg.GPU_FREE_MIB:
                 break
             STOP.wait(5)
@@ -97,6 +103,9 @@ def gpu_free():
 
 def state(key,value,error=None):
     with db.connect(True) as c:
+        current=c.execute('SELECT state FROM results WHERE key=?',(key,)).fetchone()
+        if current and current[0] in ('cancelling','cancelled') and value!='cancelled':
+            raise db.JobCancelled()
         c.execute('UPDATE results SET state=?,error=?,updated=? WHERE key=?',(value,error,time.time(),key))
         db.record_event(c,key,value)
 
@@ -112,6 +121,9 @@ def heartbeat():
 def recover():
     # Exclusive flock is held for the worker lifetime. No live peer can own these jobs.
     with db.connect(True) as c:
+        for row in c.execute("SELECT key FROM results WHERE state='cancelling'").fetchall():
+            c.execute("UPDATE results SET state='cancelled',updated=? WHERE key=?",(time.time(),row['key']))
+            db.record_event(c,row['key'],'cancelled')
         for row in c.execute("SELECT key FROM results WHERE state IN ('waiting_gpu','preparing_model','running','packaging')").fetchall():
             db.record_event(c,row['key'],'recovered')
         c.execute(f"UPDATE results SET state='queued',error=NULL WHERE state IN ({db.PLACEHOLDERS})",db.ACTIVE)
@@ -127,6 +139,17 @@ def complete_page(key,n,meta):
         c.execute('UPDATE results SET model_hashes=?,updated=? WHERE key=?',(json.dumps(meta['model_hashes'],sort_keys=True),time.time(),key))
 
 def process_job(row,engine):
+    try:
+        db.check_cancelled(row['key'])
+        _process_job(row,engine)
+    except db.JobCancelled:
+        engine.close()
+        with db.connect(True) as c:
+            c.execute("UPDATE pages SET state='pending' WHERE result_key=? AND state='running'",(row['key'],))
+        state(row['key'],'cancelled')
+        log.info('job_cancelled key=%s',row['key'][:12])
+
+def _process_job(row,engine):
     key=row['key']
     base=cfg.DATA/'results'/key
     pages_dir=base/'pages'
@@ -137,6 +160,7 @@ def process_job(row,engine):
     log.info('job_start key=%s pages=%s',key[:12],row['page_count'])
     db.event(key,'job_start')
     for n in range(1,row['page_count']+1):
+        db.check_cancelled(key)
         if STOP.is_set():
             raise InterruptedError()
         final=pages_dir/f'{n:04d}'
@@ -160,6 +184,7 @@ def process_job(row,engine):
                     pdf[n-1].get_pixmap(dpi=cfg.CONFIG['dpi']).save(source)
                 db.event(key,'recognizing',n)
                 response=engine.predict(source,staging)
+                db.check_cancelled(key)
                 db.event(key,'saving_page',n)
                 if final.exists():
                     shutil.rmtree(final)
@@ -172,6 +197,8 @@ def process_job(row,engine):
                 complete_page(key,n,response)
                 log.info('page_done key=%s page=%s seconds=%.2f',key[:12],n,response['seconds'])
                 break
+            except db.JobCancelled:
+                raise
             except InterruptedError:
                 raise
             except Exception as e:
@@ -196,6 +223,8 @@ def process_job(row,engine):
         package(base,row,pages)
         state(key,'completed')
         log.info('job_completed key=%s',key[:12])
+    except db.JobCancelled:
+        raise
     except Exception:
         state(key,'failed','archive_validation_failed')
         log.error('archive_validation_failed key=%s',key[:12])

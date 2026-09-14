@@ -8,7 +8,7 @@ import time
 from fastapi import HTTPException
 from . import config as cfg
 
-ACTIVE = ('queued', 'waiting_gpu', 'preparing_model', 'running', 'packaging')
+ACTIVE = ('queued', 'waiting_gpu', 'preparing_model', 'running', 'packaging', 'cancelling')
 PLACEHOLDERS = ','.join('?' for _ in ACTIVE)
 
 @contextlib.contextmanager
@@ -44,6 +44,9 @@ def init():
             token_hash TEXT NOT NULL, ip TEXT NOT NULL, created REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS jobs_ip ON jobs(ip);
         CREATE INDEX IF NOT EXISTS jobs_result ON jobs(result_key);
+        CREATE TABLE IF NOT EXISTS job_cancellations (
+            job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+            at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS pages (
             result_key TEXT NOT NULL REFERENCES results(key), number INTEGER NOT NULL,
             state TEXT NOT NULL, seconds REAL, error TEXT, attempts INTEGER DEFAULT 0,
@@ -80,7 +83,7 @@ def rate_limit(ip):
 
 def check_capacity(c, ip, key=None):
     count = c.execute(f'''SELECT count(DISTINCT r.key) FROM jobs j JOIN results r ON r.key=j.result_key
-        WHERE j.ip=? AND r.state IN ({PLACEHOLDERS}) AND r.key != ?''', (ip, *ACTIVE, key or '')).fetchone()[0]
+        WHERE NOT EXISTS (SELECT 1 FROM job_cancellations x WHERE x.job_id=j.id) AND j.ip=? AND r.state IN ({PLACEHOLDERS}) AND r.key != ?''', (ip, *ACTIVE, key or '')).fetchone()[0]
     if count >= cfg.MAX_IP:
         raise HTTPException(429, 'At most 2 unfinished documents per IP.')
     count = c.execute(f'SELECT count(*) FROM results WHERE state IN ({PLACEHOLDERS})', ACTIVE).fetchone()[0]
@@ -110,10 +113,17 @@ def register(path, pdf_hash, page_count, ip):
             c.executemany('INSERT INTO pages(result_key,number,state) VALUES (?,?,?)',
                           [(key, n, 'pending') for n in range(1, page_count+1)])
             record_event(c, key, 'queued')
+        elif r['state'] == 'cancelling':
+            raise HTTPException(409, 'Cancellation is still in progress. Try again shortly.')
+        elif r['state'] == 'cancelled':
+            check_capacity(c, ip)
+            c.execute("UPDATE results SET state='queued',error=NULL,created=?,updated=? WHERE key=?", (now,now,key))
+            c.execute("UPDATE pages SET state='pending',error=NULL WHERE result_key=? AND state!='done'",(key,))
+            record_event(c,key,'queued')
         elif r['state'] in ACTIVE:
             # Joining an existing GPU job does not consume global capacity, but does consume IP capacity.
             count = c.execute(f'''SELECT count(DISTINCT r.key) FROM jobs j JOIN results r ON r.key=j.result_key
-                WHERE j.ip=? AND r.state IN ({PLACEHOLDERS}) AND r.key != ?''', (ip, *ACTIVE, key)).fetchone()[0]
+                WHERE NOT EXISTS (SELECT 1 FROM job_cancellations x WHERE x.job_id=j.id) AND j.ip=? AND r.state IN ({PLACEHOLDERS}) AND r.key != ?''', (ip, *ACTIVE, key)).fetchone()[0]
             if count >= cfg.MAX_IP:
                 raise HTTPException(429, 'At most 2 unfinished documents per IP.')
         c.execute('INSERT INTO jobs VALUES (?,?,?,?,?)',
@@ -139,7 +149,14 @@ def status(ident, token):
             (j['result_key'],))][::-1]
         first = c.execute("SELECT min(at) FROM events WHERE result_key=? AND code='queued'", (j['result_key'],)).fetchone()[0]
         started = c.execute("SELECT min(at) FROM events WHERE result_key=? AND code='job_start'", (j['result_key'],)).fetchone()[0]
+        cancelled = c.execute('SELECT at FROM job_cancellations WHERE job_id=?',(ident,)).fetchone()
         heartbeat = c.execute('SELECT heartbeat FROM worker WHERE id=1').fetchone()
+    if cancelled:
+        r['state'] = 'cancelling' if r['state']=='cancelling' else 'cancelled'
+        r['updated'] = cancelled[0]
+        r['error'] = None
+        events = [e for e in events if e['at'] <= cancelled[0]]
+        events.append({'id': None, 'at':cancelled[0], 'code':r['state'], 'page':None, 'seconds':None})
     now = time.time()
     active = r['state'] in ACTIVE
     end = now if active else r['updated']
@@ -159,13 +176,42 @@ def retry(ident, token, ip):
     with connect(True) as c:
         j = authorize(c, ident, token)
         r = c.execute('SELECT * FROM results WHERE key=?', (j['result_key'],)).fetchone()
+        if c.execute('SELECT 1 FROM job_cancellations WHERE job_id=?',(ident,)).fetchone():
+            raise HTTPException(409, 'This job was cancelled. Upload the PDF again to resume.')
         if r['state'] != 'failed':
             raise HTTPException(409, 'Only failed jobs can be retried.')
         free_space()
         check_capacity(c, ip, r['key'])
         # Also enforce every existing subscriber's outstanding-document quota.
-        for owner in c.execute('SELECT DISTINCT ip FROM jobs WHERE result_key=?', (r['key'],)).fetchall():
+        for owner in c.execute('SELECT DISTINCT ip FROM jobs j WHERE result_key=? AND NOT EXISTS (SELECT 1 FROM job_cancellations x WHERE x.job_id=j.id)', (r['key'],)).fetchall():
             check_capacity(c, owner[0], r['key'])
         c.execute("UPDATE pages SET state='pending', error=NULL WHERE result_key=? AND state!='done'", (r['key'],))
         c.execute("UPDATE results SET state='queued',error=NULL,created=?,updated=? WHERE key=?", (time.time(),time.time(),r['key']))
         record_event(c, r['key'], 'queued')
+
+
+def cancel(ident, token):
+    with connect(True) as c:
+        j = authorize(c,ident,token)
+        if c.execute('SELECT 1 FROM job_cancellations WHERE job_id=?',(ident,)).fetchone():
+            return
+        r = c.execute('SELECT state FROM results WHERE key=?',(j['result_key'],)).fetchone()
+        if r['state'] not in ACTIVE:
+            raise HTTPException(409,'Only unfinished jobs can be cancelled.')
+        now = time.time()
+        c.execute('INSERT INTO job_cancellations VALUES (?,?)',(ident,now))
+        # Cancellation belongs to this capability, not unrelated subscribers.
+        remaining = c.execute("SELECT count(*) FROM jobs j WHERE result_key=? AND NOT EXISTS (SELECT 1 FROM job_cancellations x WHERE x.job_id=j.id)",(j['result_key'],)).fetchone()[0]
+        if not remaining:
+            state = 'cancelled' if r['state']=='queued' else 'cancelling'
+            c.execute('UPDATE results SET state=?,updated=? WHERE key=?',(state,now,j['result_key']))
+            record_event(c,j['result_key'],state)
+
+class JobCancelled(Exception):
+    pass
+
+def check_cancelled(key):
+    with connect() as c:
+        row = c.execute('SELECT state FROM results WHERE key=?',(key,)).fetchone()
+    if row and row[0] in ('cancelling','cancelled'):
+        raise JobCancelled()

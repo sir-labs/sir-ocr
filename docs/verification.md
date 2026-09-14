@@ -4,7 +4,7 @@ Verified on the actual RTX 5070 host, with generated test PDFs only. Historical 
 
 | Check | Evidence |
 | --- | --- |
-| Automated API/queue/artifact tests | 20 passed, including concurrent deduplication, changed configuration, bad tokens, admission/rate limits, low-space simulation, chunked-size limit, page recovery, OOM retry, validation timeout and job-scoped native-download authorization |
+| Automated API/queue/artifact tests | 27 passed, including concurrent deduplication, changed configuration, bad tokens, admission/rate limits, low-space simulation, chunked-size limit, page recovery, OOM retry, validation timeout and job-scoped native-download authorization |
 | GPU container | Paddle GPU 3.2.1, CUDA runtime 12.9, RTX 5070; tensor computation returns 14.0 |
 | Actual OOM | A test-only 32 GiB allocation raises `MemoryError`, correctly classified as `gpu_out_of_memory`; retry transitions are tested with fault injection |
 | Existing model cache | Full 3-page pipeline succeeds; page times 3.30 / 2.31 / 2.29 seconds |
@@ -49,3 +49,7 @@ Browser file selection succeeded after the user enabled the Chrome extension's f
 ## Processing timeline update
 
 The isolated browser fixture verified a running page, increasing elapsed clocks, persistent stage history, and terminal completion with a stopped clock and download link. This UI check used a fake OCR engine; earlier GPU inference evidence above remains separate. Tests cover event ordering, private token access, shared history for deduplicated uploads, restart events, the 200-event response limit and pre-existing databases.
+
+## Reader and cancellation update
+
+The isolated browser reader rendered a table, two KaTeX equations and an authenticated figure, navigated to page 2, and removed injected scripts, event handlers and unsafe links. The cancel button moved a queued fixture to cancelled. Automated tests cover cancellation access control/idempotency, low-disk and rate-limit availability, shared subscribers, preserving completed pages, re-upload resumption, cancellation across restart, and termination of a real sleeping inference subprocess (CPU fixture, no production document cancelled). Preview tests reject missing tokens, unfinished pages, traversal paths and SVG/external-image references.
