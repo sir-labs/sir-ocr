@@ -1,5 +1,27 @@
 name: sir-ocr
+x-amqp: &amqp amqp://${OCR_AMQP_USER:?set in deploy.env}:${OCR_AMQP_PASS:?set in deploy.env}@rabbitmq:5672/%2F
 services:
+  rabbitmq:
+    image: rabbitmq:4.3.5-alpine
+    hostname: sir-ocr-rabbitmq  # stable node name keeps the data dir across recreates
+    # A root healthcheck that runs before the server can create .erlang.cookie as root and crash it (eacces).
+    user: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${OCR_AMQP_USER:?set in deploy.env}
+      RABBITMQ_DEFAULT_PASS: ${OCR_AMQP_PASS:?set in deploy.env}
+    volumes:
+      - rabbitmq:/var/lib/rabbitmq
+    restart: unless-stopped
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD, rabbitmq-diagnostics, -q, ping]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: '3'}
   api:
     image: sir-ocr-api:${OCR_IMAGE_TAG:-latest}
     build:
@@ -11,8 +33,12 @@ services:
       OCR_PUBLIC_ORIGIN: ${OCR_PUBLIC_ORIGIN:-http://localhost:8000}
       OCR_TRUSTED_PROXIES: ${OCR_TRUSTED_PROXIES:-}
       OCR_DPI: ${OCR_DPI:-200}
+      OCR_AMQP_URL: *amqp
     volumes:
       - ${OCR_DATA_DIR:-./data}:/data
+    depends_on:
+      rabbitmq:
+        condition: service_started  # the app tolerates a missing broker; don't block deploys on it
     ports:
       - "127.0.0.1:${OCR_PORT:-8000}:8000"
     init: true
@@ -45,6 +71,9 @@ services:
       OCR_GPU_FREE_MIB: ${OCR_GPU_FREE_MIB:-9216}
       OCR_DPI: ${OCR_DPI:-200}
       HOME: /cache/home
+      OCR_AMQP_URL: *amqp
+      OCR_PAGE_TIMEOUT: ${OCR_PAGE_TIMEOUT:-180}
+      OCR_CHILD_STDERR: ${OCR_CHILD_STDERR:-}
     volumes:
       - ${OCR_DATA_DIR:-./data}:/data
       - ${OCR_MODEL_CACHE:-./cache/paddlex}:/cache/paddlex
@@ -52,6 +81,8 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      rabbitmq:
+        condition: service_started  # the app tolerates a missing broker; don't block deploys on it
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
@@ -77,3 +108,5 @@ services:
     logging:
       driver: json-file
       options: {max-size: 10m, max-file: '3'}
+volumes:
+  rabbitmq:

@@ -27,10 +27,19 @@ def error_code(error):
 def child(connection):
     # Paddle may print generated strings in third-party diagnostic messages.
     # Keep model stdout/stderr out of container logs; communicate only structured states.
+    # OCR_CHILD_STDERR is an opt-in diagnostic for hangs; it may contain recognized text.
     null=os.open(os.devnull,os.O_WRONLY)
+    err=null
+    if cfg.CHILD_STDERR:
+        try:
+            err=os.open(cfg.CHILD_STDERR,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+        except OSError:
+            pass  # a bad diagnostic path must not kill the child before it can report
     os.dup2(null,1)
-    os.dup2(null,2)
+    os.dup2(err,2)
     os.close(null)
+    if err!=null:
+        os.close(err)
     try:
         import paddle
         from paddleocr import PaddleOCRVL

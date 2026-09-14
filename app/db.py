@@ -6,7 +6,7 @@ import shutil
 import sqlite3
 import time
 from fastapi import HTTPException
-from . import config as cfg
+from . import broker, config as cfg
 
 ACTIVE = ('queued', 'waiting_gpu', 'preparing_model', 'running', 'packaging', 'cancelling')
 PLACEHOLDERS = ','.join('?' for _ in ACTIVE)
@@ -94,10 +94,12 @@ def register(path, pdf_hash, page_count, ip):
     key = cfg.result_key(pdf_hash)
     token, ident = secrets.token_urlsafe(32), secrets.token_hex(16)
     now = time.time()
+    queued = False
     with connect(True) as c:
         free_space()
         r = c.execute('SELECT * FROM results WHERE key=?', (key,)).fetchone()
         if not r:
+            queued = True
             check_capacity(c, ip)
             base = cfg.DATA / 'results' / key
             base.mkdir(exist_ok=True)
@@ -116,6 +118,7 @@ def register(path, pdf_hash, page_count, ip):
         elif r['state'] == 'cancelling':
             raise HTTPException(409, 'Cancellation is still in progress. Try again shortly.')
         elif r['state'] == 'cancelled':
+            queued = True
             check_capacity(c, ip)
             c.execute("UPDATE results SET state='queued',error=NULL,created=?,updated=? WHERE key=?", (now,now,key))
             c.execute("UPDATE pages SET state='pending',error=NULL WHERE result_key=? AND state!='done'",(key,))
@@ -128,6 +131,8 @@ def register(path, pdf_hash, page_count, ip):
                 raise HTTPException(429, 'At most 2 unfinished documents per IP.')
         c.execute('INSERT INTO jobs VALUES (?,?,?,?,?)',
                   (ident, key, hashlib.sha256(token.encode()).hexdigest(), ip, now))
+    if queued:  # after commit, so the worker never sees a message before its row
+        broker.publish(key)
     return {'id': ident, 'token': token, 'reused': r is not None}
 
 def authorize(c, ident, token):
@@ -188,6 +193,7 @@ def retry(ident, token, ip):
         c.execute("UPDATE pages SET state='pending', error=NULL WHERE result_key=? AND state!='done'", (r['key'],))
         c.execute("UPDATE results SET state='queued',error=NULL,created=?,updated=? WHERE key=?", (time.time(),time.time(),r['key']))
         record_event(c, r['key'], 'queued')
+    broker.publish(r['key'])
 
 
 def cancel(ident, token):

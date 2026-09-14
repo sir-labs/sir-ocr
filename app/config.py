@@ -12,6 +12,15 @@ MAX_QUEUE = int(os.getenv('OCR_MAX_QUEUE', 20))
 MAX_IP = int(os.getenv('OCR_MAX_IP', 2))
 IDLE_SECONDS = int(os.getenv('OCR_IDLE_SECONDS', 300))
 GPU_FREE_MIB = int(os.getenv('OCR_GPU_FREE_MIB', 9216))
+AMQP_URL = os.getenv('OCR_AMQP_URL', '')  # empty: no broker, the worker polls SQLite
+POLL_SECONDS = int(os.getenv('OCR_POLL_SECONDS', 30))
+PAGE_TIMEOUT = int(os.getenv('OCR_PAGE_TIMEOUT', 180))
+MODEL_TIMEOUT = int(os.getenv('OCR_MODEL_TIMEOUT', 1800))
+GPU_WAIT_TIMEOUT = int(os.getenv('OCR_GPU_WAIT_TIMEOUT', 900))
+JOB_BASE_SECONDS = int(os.getenv('OCR_JOB_BASE_SECONDS', 120))
+JOB_PAGE_SECONDS = int(os.getenv('OCR_JOB_PAGE_SECONDS', 60))
+STALL_SECONDS = int(os.getenv('OCR_STALL_SECONDS', 300))
+CHILD_STDERR = os.getenv('OCR_CHILD_STDERR', '')
 CONFIG = {
     'model': 'PaddleOCR-VL-1.6-0.9B', 'pipeline_version': 'v1.6',
     'paddle': '3.2.1', 'paddleocr': '3.7.0', 'paddlex': '3.7.2',

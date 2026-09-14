@@ -9,16 +9,24 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+import pika
 import pymupdf as fitz
-from . import config as cfg, db
+from . import broker, config as cfg, db
 from .artifacts import package
 from .inference import child
 
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 log=logging.getLogger('worker')
+logging.getLogger('pika').setLevel(logging.CRITICAL)  # broker faults are logged once as broker_unavailable
 STOP=threading.Event()
+LAST_TICK=time.monotonic()
 fitz.TOOLS.mupdf_display_errors(False)
 fitz.TOOLS.mupdf_display_warnings(False)
+
+def tick():
+    # Progress marker: heartbeat() stops beating when the main thread stalls.
+    global LAST_TICK
+    LAST_TICK=time.monotonic()
 
 class InferenceFailure(Exception):
     pass
@@ -36,16 +44,21 @@ class Engine:
                 self.process.join(15)
                 if self.process.is_alive():
                     self.process.kill()
-                    self.process.join()
+                    self.process.join(5)
             else:
                 self.process.join()
             self.connection.close()
-            self.process.close()
+            if self.process.is_alive():
+                # ponytail: a child stuck in the GPU driver survives SIGKILL; the handle is dropped, a container restart reclaims it.
+                log.error('inference_subprocess_unkillable pid=%s',self.process.pid)
+            else:
+                self.process.close()
             self.process=None
             log.info('inference_subprocess_stopped VRAM released')
     def receive(self,timeout):
         deadline=time.monotonic()+timeout
         while not STOP.is_set():
+            tick()
             if self.key:
                 db.check_cancelled(self.key)
             if self.connection.poll(1):
@@ -70,10 +83,14 @@ class Engine:
         self.close()
         state(key,'waiting_gpu')
         log.info('waiting_gpu minimum_free_mib=%s',cfg.GPU_FREE_MIB)
+        give_up=time.monotonic()+cfg.GPU_WAIT_TIMEOUT
         while not STOP.is_set():
+            tick()
             db.check_cancelled(key)
             if gpu_free()>=cfg.GPU_FREE_MIB:
                 break
+            if time.monotonic()>give_up:
+                raise InferenceFailure('gpu_wait_timeout')
             STOP.wait(5)
         if STOP.is_set():
             raise InterruptedError()
@@ -85,12 +102,12 @@ class Engine:
         self.process=ctx.Process(target=child,args=(remote,))
         self.process.start()
         remote.close()
-        self.receive(1800)
+        self.receive(cfg.MODEL_TIMEOUT)
         db.event(key,'model_ready')
         self.last_use=time.monotonic()
     def predict(self,source,staging):
         self.connection.send({'source':str(source),'staging':str(staging)})
-        result=self.receive(600)
+        result=self.receive(cfg.PAGE_TIMEOUT)
         self.last_use=time.monotonic()
         return result
 
@@ -109,11 +126,18 @@ def state(key,value,error=None):
         c.execute('UPDATE results SET state=?,error=?,updated=? WHERE key=?',(value,error,time.time(),key))
         db.record_event(c,key,value)
 
+def beat():
+    # A stalled main thread must read as offline, not merely a live heartbeat thread.
+    if time.monotonic()-LAST_TICK>cfg.STALL_SECONDS:
+        log.warning('worker_stalled seconds=%.0f',time.monotonic()-LAST_TICK)
+        return
+    with db.connect(True) as c:
+        c.execute('INSERT OR REPLACE INTO worker VALUES (1,?)',(time.time(),))
+
 def heartbeat():
     while not STOP.is_set():
         try:
-            with db.connect(True) as c:
-                c.execute('INSERT OR REPLACE INTO worker VALUES (1,?)',(time.time(),))
+            beat()
         except Exception:
             log.error('heartbeat_failed')
         STOP.wait(5)
@@ -159,19 +183,31 @@ def _process_job(row,engine):
         return
     log.info('job_start key=%s pages=%s',key[:12],row['page_count'])
     db.event(key,'job_start')
+    # One slow document must not hold the single GPU queue indefinitely.
+    deadline=time.monotonic()+cfg.JOB_BASE_SECONDS+cfg.JOB_PAGE_SECONDS*row['page_count']
     for n in range(1,row['page_count']+1):
         db.check_cancelled(key)
         if STOP.is_set():
             raise InterruptedError()
+        tick()
         final=pages_dir/f'{n:04d}'
         if (final/'complete.json').exists():
             complete_page(key,n,json.loads((final/'complete.json').read_text()))
             continue
+        if time.monotonic()>deadline:
+            with db.connect(True) as c:
+                db.record_event(c,key,'job_deadline',n)
+                c.execute("UPDATE pages SET state='failed',error='job_deadline' WHERE result_key=? AND state!='done'",(key,))
+            log.error('job_deadline key=%s page=%s',key[:12],n)
+            break
         staging=base/f'.page-{n:04d}.tmp'
+        stop=False
         for attempt in range(2):
             try:
                 db.free_space()
+                waited=time.monotonic()
                 engine.ensure(key)
+                deadline+=time.monotonic()-waited  # GPU wait and model load don't spend the job budget
                 state(key,'running')
                 with db.connect(True) as c:
                     c.execute("UPDATE pages SET state='running',attempts=attempts+1,error=NULL WHERE result_key=? AND number=?",(key,n))
@@ -211,8 +247,14 @@ def _process_job(row,engine):
                 with db.connect(True) as c:
                     db.record_event(c,key,'page_failed',n)
                     c.execute("UPDATE pages SET state='failed',error=? WHERE result_key=? AND number=?",(error,key,n))
+                    if error=='gpu_wait_timeout':
+                        # Waiting again for every remaining page would hold the queue pages×timeout.
+                        c.execute("UPDATE pages SET state='failed',error=? WHERE result_key=? AND state!='done'",(error,key))
+                        stop=True
                 log.error('page_failed key=%s page=%s code=%s',key[:12],n,error)
                 break
+        if stop:
+            break
     with db.connect() as c:
         pages=[dict(p) for p in c.execute('SELECT number,state,seconds,error,attempts FROM pages WHERE result_key=? ORDER BY number',(key,))]
     if any(p['state']!='done' for p in pages):
@@ -229,6 +271,59 @@ def _process_job(row,engine):
         state(key,'failed','archive_validation_failed')
         log.error('archive_validation_failed key=%s',key[:12])
 
+def queued_keys():
+    with db.connect() as c:
+        return [r[0] for r in c.execute("SELECT key FROM results WHERE state='queued' ORDER BY created,key")]
+
+def handle(key,engine):
+    # Idempotent consumer: cancelled, finished, deleted or duplicate messages are skipped.
+    with db.connect() as c:
+        row=c.execute('SELECT * FROM results WHERE key=?',(key,)).fetchone()
+    if not row or row['state']!='queued':
+        log.info('message_skipped key=%s',key[:12])
+        return False
+    process_job(dict(row),engine)
+    return True
+
+def drain(engine):
+    # Fallback poll: covers a missing broker and any message lost between commit and publish.
+    while not STOP.is_set():
+        keys=queued_keys()
+        if not keys:
+            return
+        tick()
+        handle(keys[0],engine)
+
+def idle(engine):
+    if engine.process and time.monotonic()-engine.last_use>=cfg.IDLE_SECONDS:
+        engine.close()
+
+def consume(engine):
+    con=pika.BlockingConnection(broker.params())
+    try:
+        ch=con.channel()
+        broker.declare(ch)
+        ch.basic_qos(prefetch_count=1)
+        broker.resync(ch,queued_keys)
+        log.info('broker_connected')
+        polled=time.monotonic()
+        for method,_,body in ch.consume(broker.QUEUE,inactivity_timeout=1):
+            tick()
+            if STOP.is_set():
+                break
+            if method:
+                # Ack before the GPU work: SQLite and recover() own redelivery, so a long job
+                # never holds an unacked message past RabbitMQ's consumer_timeout.
+                ch.basic_ack(method.delivery_tag)
+                handle(body.decode(),engine)
+            elif time.monotonic()-polled>=cfg.POLL_SECONDS:
+                drain(engine)
+                polled=time.monotonic()
+            idle(engine)
+    finally:
+        if con.is_open:
+            con.close()
+
 def main():
     db.init()
     lock=(cfg.DATA/'worker.lock').open('a')
@@ -244,14 +339,19 @@ def main():
     engine=Engine()
     try:
         while not STOP.is_set():
-            with db.connect() as c:
-                row=c.execute("SELECT * FROM results WHERE state='queued' ORDER BY created,key LIMIT 1").fetchone()
-            if row:
-                process_job(dict(row),engine)
-            else:
-                if engine.process and time.monotonic()-engine.last_use>=cfg.IDLE_SECONDS:
-                    engine.close()
-                STOP.wait(1)
+            tick()
+            if cfg.AMQP_URL:
+                try:
+                    consume(engine)
+                    continue
+                except InterruptedError:
+                    raise
+                except pika.exceptions.AMQPError as e:
+                    # Only broker faults fall back here; job errors (OSError) crash the worker so recover() requeues.
+                    log.warning('broker_unavailable error=%s',type(e).__name__)
+            drain(engine)
+            idle(engine)
+            STOP.wait(5 if cfg.AMQP_URL else 1)
     except InterruptedError:
         pass
     finally:

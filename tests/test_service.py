@@ -9,16 +9,21 @@ import pymupdf as fitz
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from app import config as cfg, db
+from app import broker, config as cfg, db, worker
 from app.api import app, client_ip
 from app.artifacts import finish_page, package, normalize_math
 from app.worker import recover, process_job, InferenceFailure, STOP
 from starlette.requests import Request
 
+REAL_PUBLISH=broker.publish
+PUBLISHED=[]
+
 @pytest.fixture
 def client(tmp_path,monkeypatch):
     monkeypatch.setattr(cfg,'DATA',tmp_path)
     monkeypatch.setattr(cfg,'MIN_FREE',0)
+    PUBLISHED.clear()
+    monkeypatch.setattr(broker,'publish',PUBLISHED.append)
     STOP.clear()
     with TestClient(app) as client:
         yield client
@@ -44,6 +49,7 @@ class FakeEngine:
         self.calls=[]
         self.fail=fail
         self.closed=0
+        self.process=None
     def ensure(self,key):
         pass
     def close(self):
@@ -400,3 +406,124 @@ def test_running_cancel_terminates_inference_subprocess(client):
     assert time.monotonic()-start < 5
     assert engine.process is None
     assert pid not in [p.pid for p in mp.active_children()]
+
+
+def test_publish_only_when_a_queued_event_is_recorded(client):
+    blob=pdf()
+    a=submit(client,blob).json();key=result_row(a)['key']
+    assert PUBLISHED==[key]
+    b=submit(client,blob).json()  # joins the in-flight result: no second message
+    assert PUBLISHED==[key]
+    db.cancel(a['id'],a['token']);db.cancel(b['id'],b['token'])
+    c=submit(client,blob).json()  # resume after cancel re-queues
+    assert PUBLISHED==[key,key]
+    process_job(result_row(c),FakeEngine(fail=lambda n,count:True))
+    assert client.post(f"/api/jobs/{c['id']}/retry",headers=headers(c)).status_code==200
+    assert PUBLISHED==[key,key,key]
+
+
+def test_publish_failure_never_fails_upload(client,monkeypatch):
+    monkeypatch.setattr(broker,'publish',REAL_PUBLISH)
+    monkeypatch.setattr(cfg,'AMQP_URL','amqp://u:p@127.0.0.1:1/%2F')
+    r=submit(client)
+    assert r.status_code==201
+    assert db.status(r.json()['id'],r.json()['token'])['state']=='queued'
+
+
+def test_consumer_skips_stale_and_duplicate_messages(client):
+    a=submit(client,pdf('a')).json();b=submit(client,pdf('b')).json()
+    db.cancel(a['id'],a['token'])
+    engine=FakeEngine()
+    assert not worker.handle(result_row(a)['key'],engine)
+    assert not worker.handle('missing',engine)
+    assert engine.calls==[]
+    assert worker.handle(result_row(b)['key'],engine)
+    assert db.status(b['id'],b['token'])['state']=='completed'
+    assert not worker.handle(result_row(b)['key'],engine)
+    assert engine.calls==[1]
+
+
+def test_resync_rebuilds_queue_oldest_first(client):
+    ka=result_row(submit(client,pdf('a')).json())['key']
+    kb=result_row(submit(client,pdf('b')).json())['key']
+    with db.connect(True) as c:
+        c.execute('UPDATE results SET created=1 WHERE key=?',(kb,))
+        c.execute('UPDATE results SET created=2 WHERE key=?',(ka,))
+    class Channel:
+        calls=[]
+        def queue_purge(self,queue):
+            self.calls.append(('purge',queue))
+        def basic_publish(self,exchange,routing_key,body,properties=None,mandatory=False):
+            self.calls.append(('publish',body.decode()))
+    ch=Channel()
+    broker.resync(ch,worker.queued_keys)
+    assert ch.calls==[('purge','ocr.jobs'),('publish',kb),('publish',ka)]
+
+
+def test_job_deadline_fails_remaining_pages_and_retry_resumes(client,monkeypatch):
+    j=submit(client,pdf(pages=2)).json()
+    with monkeypatch.context() as patch:
+        patch.setattr(cfg,'JOB_BASE_SECONDS',-1)
+        patch.setattr(cfg,'JOB_PAGE_SECONDS',0)
+        engine=FakeEngine();process_job(result_row(j),engine)
+    status=db.status(j['id'],j['token'])
+    assert engine.calls==[] and status['state']=='failed'
+    assert {p['error'] for p in status['pages']}=={'job_deadline'}
+    assert client.post(f"/api/jobs/{j['id']}/retry",headers=headers(j)).status_code==200
+    engine=FakeEngine();process_job(result_row(j),engine)
+    assert engine.calls==[1,2] and db.status(j['id'],j['token'])['state']=='completed'
+
+
+def test_gpu_wait_is_bounded(client,monkeypatch):
+    key=result_row(submit(client).json())['key']
+    monkeypatch.setattr(worker,'gpu_free',lambda:0)
+    monkeypatch.setattr(cfg,'GPU_WAIT_TIMEOUT',-1)
+    with pytest.raises(InferenceFailure,match='gpu_wait_timeout'):
+        worker.Engine().ensure(key)
+
+
+def test_heartbeat_stops_when_worker_stalls(client,monkeypatch):
+    def rows():
+        with db.connect() as c:
+            return c.execute('SELECT count(*) FROM worker').fetchone()[0]
+    monkeypatch.setattr(worker,'LAST_TICK',time.monotonic()-cfg.STALL_SECONDS-1)
+    worker.beat()
+    assert rows()==0
+    worker.tick();worker.beat()
+    assert rows()==1
+
+
+@pytest.mark.skipif(not cfg.AMQP_URL,reason='needs RabbitMQ at OCR_AMQP_URL')
+def test_rabbitmq_round_trip(client,monkeypatch):
+    monkeypatch.setattr(broker,'publish',REAL_PUBLISH)
+    j=submit(client).json()
+    real=worker.process_job
+    def once(row,engine):
+        real(row,engine);STOP.set()
+    monkeypatch.setattr(worker,'process_job',once)
+    worker.consume(FakeEngine())
+    assert db.status(j['id'],j['token'])['state']=='completed'
+
+
+def test_gpu_wait_timeout_fails_remaining_pages_once(client):
+    j=submit(client,pdf(pages=3)).json()
+    class Busy(FakeEngine):
+        waits=0
+        def ensure(self,key):
+            self.waits+=1
+            raise InferenceFailure('gpu_wait_timeout')
+    engine=Busy();process_job(result_row(j),engine)
+    status=db.status(j['id'],j['token'])
+    assert engine.waits==1 and status['state']=='failed'
+    assert {p['error'] for p in status['pages']}=={'gpu_wait_timeout'}
+
+
+def test_gpu_wait_and_model_load_do_not_spend_job_budget(client,monkeypatch):
+    j=submit(client,pdf(pages=2)).json()
+    monkeypatch.setattr(cfg,'JOB_BASE_SECONDS',0.5)
+    monkeypatch.setattr(cfg,'JOB_PAGE_SECONDS',0)
+    class SlowStart(FakeEngine):
+        def ensure(self,key):
+            time.sleep(1)  # longer than the whole budget
+    process_job(result_row(j),SlowStart())
+    assert db.status(j['id'],j['token'])['state']=='completed'
