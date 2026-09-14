@@ -170,6 +170,10 @@ def test_proxy_and_origin(client,monkeypatch):
     assert client_ip(request('1.2.3.4','9.9.9.9'))=='1.2.3.4'
     assert client_ip(request('172.20.0.2','9.9.9.9, 1.2.3.4, 172.20.0.9'))=='1.2.3.4'
     assert client.post('/api/jobs',headers={'Origin':'https://evil.example'}).status_code==403
+    assert client.post('/api/jobs',headers={'Origin':'null'}).status_code==403
+    monkeypatch.setenv('OCR_PUBLIC_ORIGIN', 'https://ocr.sir-labs.com')
+    assert client.post('/api/jobs',headers={'Origin':'https://ocr.sir-labs.com'}).status_code==400
+    assert client.get('/').headers['referrer-policy']=='strict-origin'
 
 def test_math_code_unchanged():
     text='`\\(code\\)` and \\( x \\) and \\[y\\]'

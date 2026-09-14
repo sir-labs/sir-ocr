@@ -1,4 +1,5 @@
 import json
+import logging
 import asyncio
 import subprocess
 import sys
@@ -60,6 +61,10 @@ class LimitsMiddleware:
                 origin = request.headers.get('origin')
                 expected = os.getenv('OCR_PUBLIC_ORIGIN', 'http://localhost:8000')
                 if origin and origin != expected:
+                    # Only classify headers; never log arbitrary URLs or capabilities.
+                    origin_kind = 'null' if origin == 'null' else 'other'
+                    logging.getLogger('uvicorn.error').warning(
+                        'origin_rejected origin_kind=%s', origin_kind)
                     raise HTTPException(403, 'Cross-origin requests are disabled.')
                 await run_in_threadpool(db.rate_limit, client_ip(request))
                 await run_in_threadpool(db.free_space)
@@ -79,7 +84,7 @@ class LimitsMiddleware:
                 return message
             async def safe_send(message):
                 if message['type']=='http.response.start':
-                    message['headers'] += [(b'cache-control',b'no-store'),(b'referrer-policy',b'no-referrer'),
+                    message['headers'] += [(b'cache-control',b'no-store'),(b'referrer-policy',b'strict-origin'),
                         (b'x-content-type-options',b'nosniff'),
                         (b'content-security-policy',b"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")]
                 await send(message)
