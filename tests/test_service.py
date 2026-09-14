@@ -244,3 +244,17 @@ def test_native_download_cookie_is_job_scoped(client):
     assert client.get(url + '/download', headers={'Authorization':'Bearer wrong'}).status_code == 404
     other = submit(client, pdf('different')).json()
     assert client.get(f"/api/jobs/{other['id']}/download").status_code == 404
+
+
+def test_https_redirect_trust_and_no_loop(client, monkeypatch):
+    monkeypatch.setenv('OCR_PUBLIC_ORIGIN', 'https://ocr.sir-labs.com')
+    # Untrusted clients cannot trigger a redirect by supplying CF headers.
+    assert client.get('/', headers={'CF-Visitor':'{"scheme":"http"}'}, follow_redirects=False).status_code == 200
+    monkeypatch.setenv('OCR_TRUSTED_PROXIES', '172.20.0.2/32')
+    with TestClient(app, client=('172.20.0.2', 1234)) as proxy:
+        response = proxy.get('/?view=upload', headers={'CF-Visitor':'{"scheme":"http"}'}, follow_redirects=False)
+        assert response.status_code == 308
+        assert response.headers['location'] == 'https://ocr.sir-labs.com/?view=upload'
+        for value in ['{"scheme":"https"}', '{}', 'invalid', 'null']:
+            assert proxy.get('/', headers={'CF-Visitor': value}, follow_redirects=False).status_code == 200
+        assert proxy.get('/healthz', follow_redirects=False).status_code == 200

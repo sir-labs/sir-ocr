@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from . import config as cfg, db
@@ -26,20 +26,22 @@ async def lifespan(app):
 
 app = FastAPI(title='SIR OCR', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
+def is_trusted_proxy(value):
+    try:
+        address = ipaddress.ip_address(value)
+        return any(address in ipaddress.ip_network(n.strip())
+                   for n in os.getenv('OCR_TRUSTED_PROXIES', '').split(',') if n.strip())
+    except ValueError:
+        return False
+
 def client_ip(request):
     peer = request.client.host if request.client else 'unknown'
-    trusted = [ipaddress.ip_network(s.strip()) for s in os.getenv('OCR_TRUSTED_PROXIES', '').split(',') if s.strip()]
-    def is_trusted(value):
-        try:
-            return any(ipaddress.ip_address(value) in n for n in trusted)
-        except ValueError:
-            return False
-    if not is_trusted(peer):
+    if not is_trusted_proxy(peer):
         return peer
     # Walk from the nearest hop. Never trust the arbitrary leftmost value.
     hops = [s.strip() for s in request.headers.get('x-forwarded-for','').split(',') if s.strip()]
     for value in reversed(hops):
-        if not is_trusted(value):
+        if not is_trusted_proxy(value):
             try:
                 return str(ipaddress.ip_address(value))
             except ValueError:
@@ -56,10 +58,22 @@ class LimitsMiddleware:
         if scope['type'] != 'http':
             return await self.app(scope, receive, send)
         request = Request(scope)
+        expected = os.getenv('OCR_PUBLIC_ORIGIN', 'http://localhost:8000')
+        # nginx's transport is HTTP even for public HTTPS. CF-Visitor preserves
+        # the original scheme; accept it only from the configured proxy peers.
+        if expected.startswith('https://') and request.client and is_trusted_proxy(request.client.host):
+            try:
+                visitor = json.loads(request.headers.get('cf-visitor', '{}'))
+            except (ValueError, TypeError):
+                visitor = {}
+            if isinstance(visitor, dict) and visitor.get('scheme') == 'http':
+                target = expected.rstrip('/') + request.url.path
+                if request.url.query:
+                    target += '?' + request.url.query
+                return await RedirectResponse(target, status_code=308)(scope, receive, send)
         try:
             if scope['method']=='POST':
                 origin = request.headers.get('origin')
-                expected = os.getenv('OCR_PUBLIC_ORIGIN', 'http://localhost:8000')
                 if origin and origin != expected:
                     # Only classify headers; never log arbitrary URLs or capabilities.
                     origin_kind = 'null' if origin == 'null' else 'other'
