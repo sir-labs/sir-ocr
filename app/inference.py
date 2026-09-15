@@ -1,4 +1,5 @@
 """Spawn-only GPU child; no tokens or recognized content are emitted to logs."""
+import faulthandler
 import hashlib
 import os
 import time
@@ -50,6 +51,9 @@ def child(connection):
             device='gpu:0',use_doc_orientation_classify=False,use_doc_unwarping=False,
             use_ocr_for_image_block=True,use_chart_recognition=False,use_queues=False)
         hashes=model_hashes()
+        # Intermittent page hangs spin one CPU core with the GPU idle. Record where: Python
+        # frames only (file, line, function), never recognized text, so it can stay enabled.
+        hangs=open(cfg.DATA/'hang-stacks.log','a')
         connection.send({'state':'ready','model_hashes':hashes})
         while True:
             command=connection.recv()
@@ -61,10 +65,16 @@ def child(connection):
                 raw=staging/'raw'
                 raw.mkdir()
                 count=0
-                for result in model.predict(command['source'],max_new_tokens=cfg.CONFIG['max_new_tokens']):
-                    result.save_to_json(str(raw))
-                    result.save_to_markdown(str(raw))
-                    count+=1
+                hangs.write(f'--- {time.strftime("%Y-%m-%dT%H:%M:%S%z")} pid={os.getpid()} {staging.name}\n')
+                hangs.flush()
+                faulthandler.dump_traceback_later(60,repeat=True,file=hangs)
+                try:
+                    for result in model.predict(command['source'],max_new_tokens=cfg.CONFIG['max_new_tokens']):
+                        result.save_to_json(str(raw))
+                        result.save_to_markdown(str(raw))
+                        count+=1
+                finally:
+                    faulthandler.cancel_dump_traceback_later()
                 if count != 1:
                     raise RuntimeError('Unexpected prediction count.')
                 seconds=time.monotonic()-start
