@@ -56,6 +56,10 @@ def init():
             result_key TEXT NOT NULL REFERENCES results(key) ON DELETE CASCADE,
             at REAL NOT NULL, code TEXT NOT NULL, page INTEGER, seconds REAL);
         CREATE INDEX IF NOT EXISTS events_result ON events(result_key,id);
+        -- One row per (result, user) already copied to sir-dataset, so a poll loop pushes once.
+        CREATE TABLE IF NOT EXISTS dataset_pushes (
+            result_key TEXT NOT NULL REFERENCES results(key) ON DELETE CASCADE,
+            owner_id TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(result_key, owner_id));
         CREATE TABLE IF NOT EXISTS requests (ip TEXT NOT NULL, at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS requests_at ON requests(at);
         CREATE TABLE IF NOT EXISTS worker (id INTEGER PRIMARY KEY CHECK(id=1), heartbeat REAL NOT NULL);
@@ -134,6 +138,24 @@ def register(path, pdf_hash, page_count, ip):
     if queued:  # after commit, so the worker never sees a message before its row
         broker.publish(key)
     return {'id': ident, 'token': token, 'reused': r is not None}
+
+def claim_push(key, owner_id):
+    """True if this caller should push (result, owner) to sir-dataset. Claimed before the
+    upload, not after, so two concurrent polls cannot both push; release_push undoes it."""
+    with connect(True) as c:
+        cur = c.execute('INSERT OR IGNORE INTO dataset_pushes VALUES (?,?,?)', (key, owner_id, time.time()))
+        return cur.rowcount == 1
+
+
+def release_push(key, owner_id):
+    with connect(True) as c:
+        c.execute('DELETE FROM dataset_pushes WHERE result_key=? AND owner_id=?', (key, owner_id))
+
+
+def result_key(ident, token):
+    with connect() as c:
+        return authorize(c, ident, token)['result_key']
+
 
 def authorize(c, ident, token):
     row = c.execute('SELECT * FROM jobs WHERE id=?', (ident,)).fetchone()

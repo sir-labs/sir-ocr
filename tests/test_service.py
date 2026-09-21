@@ -9,7 +9,7 @@ import pymupdf as fitz
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from app import broker, config as cfg, db, worker
+from app import broker, config as cfg, dataset, db, worker
 from app.api import app, client_ip
 from app.artifacts import finish_page, package, normalize_math
 from app.worker import recover, process_job, InferenceFailure, STOP
@@ -91,6 +91,46 @@ def test_upload_token_zip_and_reuse(client):
         assert json.loads(z.read('manifest.json'))['pdf_sha256']==hashlib.sha256(blob).hexdigest()
     assert submit(client,blob).json()['reused']
     assert 'token' not in (cfg.DATA/'results'/row['key']/'manifest.json').read_text().replace('max_new_tokens','')
+
+def test_completed_job_is_pushed_to_the_dataset_once_per_user(client,monkeypatch):
+    pushes=[]
+    monkeypatch.setattr(dataset,'enabled',lambda:True)
+    monkeypatch.setattr(dataset,'push_result',lambda owner,key,base:pushes.append((owner,key,base)))
+    blob=pdf(pages=1)
+    job=submit(client,blob).json()
+    process_job(result_row(job),FakeEngine())
+
+    # An unfinished poll pushes nothing; a signed-out poll pushes nothing.
+    assert client.get(f"/api/jobs/{job['id']}",headers=headers(job)).json()['state']=='completed'
+    assert pushes==[]
+
+    signed_in={**headers(job),'X-Auth-User-Id':'u1'}
+    client.get(f"/api/jobs/{job['id']}",headers=signed_in)
+    client.get(f"/api/jobs/{job['id']}",headers=signed_in)
+    assert [p[0] for p in pushes]==['u1']  # claimed once, not once per poll
+    assert (pushes[0][2]/'source.pdf').exists()
+
+    # The same result reached by a second user is that user's to keep too.
+    other=submit(client,blob).json()
+    client.get(f"/api/jobs/{other['id']}",headers={**headers(other),'X-Auth-User-Id':'u2'})
+    assert [p[0] for p in pushes]==['u1','u2']
+
+
+def test_a_failed_push_is_retried_on_the_next_poll(client,monkeypatch):
+    monkeypatch.setattr(dataset,'enabled',lambda:True)
+    attempts=[]
+    def flaky(owner,key,base):
+        attempts.append(owner)
+        if len(attempts)==1:
+            raise RuntimeError('sir-dataset down')
+    monkeypatch.setattr(dataset,'push_result',flaky)
+    job=submit(client).json()
+    process_job(result_row(job),FakeEngine())
+    signed_in={**headers(job),'X-Auth-User-Id':'u1'}
+    client.get(f"/api/jobs/{job['id']}",headers=signed_in)
+    client.get(f"/api/jobs/{job['id']}",headers=signed_in)
+    assert attempts==['u1','u1']
+
 
 def test_concurrent_duplicate_atomic(client):
     blob=pdf()

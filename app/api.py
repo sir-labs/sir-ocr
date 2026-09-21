@@ -10,11 +10,11 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
-from . import config as cfg, db
+from . import config as cfg, dataset, db
 from .artifacts import image_refs
 
 STATIC = Path(__file__).parent / 'static'
@@ -162,10 +162,31 @@ async def create_job(request: Request):
         if path:
             path.unlink(missing_ok=True)
 
+def save_to_dataset(ident, token, owner_id):
+    """Copy a finished result into the caller's sir-dataset, once.
+
+    ponytail: triggered by the status poll, which is the only moment both the finished result
+    and the signed-in user are known here (a result is shared between users; the worker knows
+    neither). A user who closes the tab before the job finishes never triggers it — add a
+    sweep over jobs if that turns out to matter.
+    """
+    key = db.result_key(ident, token)
+    if not db.claim_push(key, owner_id):
+        return
+    try:
+        dataset.push_result(owner_id, key, cfg.DATA / 'results' / key)
+    except Exception:
+        db.release_push(key, owner_id)
+        logging.getLogger('uvicorn.error').exception('dataset_push_failed key=%s', key[:12])
+
+
 @app.get('/api/jobs/{ident}')
-def get_job(ident: str, request: Request, response: Response):
+def get_job(ident: str, request: Request, response: Response, background: BackgroundTasks):
     token = bearer(request)
     result = db.status(ident, token)
+    owner_id = request.headers.get('x-auth-user-id', '')
+    if result['state'] == 'completed' and owner_id and dataset.enabled():
+        background.add_task(save_to_dataset, ident, token, owner_id)
     # Native file downloads cannot add an Authorization header. Grant only this
     # job's download path a Secure/HttpOnly capability after bearer verification.
     response.set_cookie(

@@ -3,6 +3,9 @@ services:
     networks: [default, sir-net]
     environment:
       OCR_PUBLIC_ORIGIN: https://ocr.sir-labs.com
+      # Finished results are copied to the central store, by container name on sir-net.
+      DATASET_URL: ${DATASET_URL:-http://sir-dataset-api-1:8000}
+      DATASET_SERVICE_TOKEN: ${DATASET_SERVICE_TOKEN:-}
     labels:
       proxy.enable: 'true'
       proxy.host: ocr.sir-labs.com
