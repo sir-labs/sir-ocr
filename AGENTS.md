@@ -24,9 +24,16 @@ Over `sir-server_sir-net`, **by container name**, never through a public URL:
 | API | `sir-data-api-1:8000` |
 | Postgres | `sir-data-db-1:5432` |
 | Objects (MinIO) | `sir-data-minio-1:9000` |
-| Events (RabbitMQ) | `sir-data-rabbitmq-1:5672` |
+| Fanout (RabbitMQ) | `sir-data-rabbitmq-1:5672` |
+| Event log (Kafka) | `sir-data-kafka-1:9092` |
+| Cache (Redis) | `sir-data-redis-1:6379` |
 
 Physical storage for all of it lives under `~/.sir-labs` (`$SIR_LABS_DATA`) on the host.
+
+Only the API is yours to call. Postgres, MinIO, Kafka and Redis are sir-data's internals:
+pushing straight into the bucket or the broker skips the ownership checks and the row that
+makes an object findable. The one exception is **reading** the Kafka topic `dataset.events` —
+that is what the log is for, and a consumer replays it from an offset.
 
 `app/dataset.py` is stdlib-only on purpose: it runs in both the api and worker images, and a
 new dependency means rebuilding both locks to make two HTTP calls.
