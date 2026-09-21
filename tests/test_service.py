@@ -122,7 +122,7 @@ def test_a_failed_push_is_retried_on_the_next_poll(client,monkeypatch):
     def flaky(owner,key,base):
         attempts.append(owner)
         if len(attempts)==1:
-            raise RuntimeError('sir-dataset down')
+            raise RuntimeError('sir-data down')
     monkeypatch.setattr(dataset,'push_result',flaky)
     job=submit(client).json()
     process_job(result_row(job),FakeEngine())

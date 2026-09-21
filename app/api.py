@@ -163,7 +163,7 @@ async def create_job(request: Request):
             path.unlink(missing_ok=True)
 
 def save_to_dataset(ident, token, owner_id):
-    """Copy a finished result into the caller's sir-dataset, once.
+    """Copy a finished result into the caller's sir-data, once.
 
     ponytail: triggered by the status poll, which is the only moment both the finished result
     and the signed-in user are known here (a result is shared between users; the worker knows

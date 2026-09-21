@@ -1,7 +1,7 @@
-"""Pushes a finished OCR result to sir-dataset, the central store for sir-labs.
+"""Pushes a finished OCR result to sir-data, the central store for sir-labs.
 
 /data here is scratch — results are keyed by PDF hash, shared between users and pruned. What
-a user should keep goes to sir-dataset, owned by the sir-auth user nginx identified, so it
+a user should keep goes to sir-data, owned by the sir-auth user nginx identified, so it
 outlives this container and shows up next to their other data.
 
 stdlib only: this module runs in both images, and adding a dependency (plus a lock rebuild)
@@ -18,8 +18,8 @@ from pathlib import Path
 
 log = logging.getLogger('dataset')
 
-URL = os.environ.get('DATASET_URL', 'http://sir-dataset-api-1:8000').rstrip('/')
-TOKEN = os.environ.get('DATASET_SERVICE_TOKEN', '')
+URL = os.environ.get('DATA_URL', 'http://sir-data-api-1:8000').rstrip('/')
+TOKEN = os.environ.get('DATA_SERVICE_TOKEN', '')
 NAME = os.environ.get('DATASET_NAME', 'ocr')
 TIMEOUT = 120
 
@@ -30,7 +30,7 @@ def enabled():
 
 def _call(path, owner_id, body=b'', content_type=None, method='POST'):
     request = urllib.request.Request(f'{URL}{path}', data=body, method=method, headers={
-        'Authorization': f'Bearer {TOKEN}', 'X-Dataset-Service': 'sir-ocr',
+        'Authorization': f'Bearer {TOKEN}', 'X-Data-Service': 'sir-ocr',
         'X-On-Behalf-Of': owner_id, **({'Content-Type': content_type} if content_type else {})})
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
         return json.loads(response.read() or b'null')
