@@ -1,8 +1,9 @@
-"""Host-only maintenance. Stop the worker before deletion; no HTTP delete endpoint."""
+"""Host-only maintenance. Stop both workers before deletion; no HTTP delete endpoint."""
 import argparse
 import fcntl
 import json
 import shutil
+from contextlib import ExitStack
 from . import db, config as cfg
 parser=argparse.ArgumentParser()
 commands=parser.add_subparsers(dest='command',required=True)
@@ -19,11 +20,13 @@ if args.command=='list':
 else:
     if args.confirm!=args.result_key:
         raise SystemExit('Confirmation does not match.')
-    with (cfg.DATA/'worker.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit('Stop the worker first.')
+    with ExitStack() as stack:
+        for name in ('worker.lock','classifier.lock'):
+            lock=stack.enter_context((cfg.DATA/name).open('a'))
+            try:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SystemExit('Stop the OCR worker and classifier first.')
         with db.connect(True) as c:
             row=c.execute('SELECT key FROM results WHERE key=?',(args.result_key,)).fetchone()
             if not row:

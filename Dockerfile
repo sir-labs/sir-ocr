@@ -21,3 +21,12 @@ ENV PADDLE_PDX_CACHE_HOME=/cache/paddlex HF_HOME=/cache/huggingface PADDLE_PDX_D
 COPY app ./app
 USER 1000:1000
 CMD ["python", "-m", "app.worker"]
+
+FROM common AS classifier
+RUN apt-get update && apt-get install -y --no-install-recommends git libgomp1 && rm -rf /var/lib/apt/lists/*
+COPY requirements-classifier.lock ./
+RUN --mount=type=cache,target=/root/.cache/pip pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-classifier.lock
+ENV HF_HOME=/cache/huggingface CUDA_VISIBLE_DEVICES="" CLASSIFIER_THREADS=4
+COPY app ./app
+USER 1000:1000
+CMD ["python", "-m", "app.classifier_worker"]

@@ -55,6 +55,12 @@ def _annotate(owner_id, item_id, kind, payload):
           json.dumps(payload).encode(), 'application/json')
 
 
+def source_item(owner_id, key, base: Path):
+    dataset_id = _call(f'/datasets?name={NAME}', owner_id)['id']
+    # The central API deduplicates by dataset + content SHA-256.
+    return _upload(owner_id, dataset_id, base / 'source.pdf', key)
+
+
 def push_result(owner_id, key, base: Path):
     """The source PDF as the item, the OCR output as annotations, the ZIP alongside it
     (page images only exist inside the ZIP). Raises so the caller can un-mark the push."""

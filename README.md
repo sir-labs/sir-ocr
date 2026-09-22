@@ -19,6 +19,16 @@ Pinned runtime: Python 3.12, Paddle GPU 3.2.1 / CUDA 12.9, PaddleOCR 3.7.0, Padd
 
 ## API
 
+### Automatic page classification
+
+Completed OCR pages are classified asynchronously by a separate CPU-only OpenThai
+worker. The status page shows document type/topic suggestions; the reader can
+filter pages by exercise, example, proof and other roles. Signed-in users can
+provide their own folder candidates and confirm or correct document labels and
+the suggested destination. Classification failures do not block OCR or downloads.
+Reviews are private to the user and exported through sir-data; no files are moved
+in Obsidian. See [classification architecture and verification](docs/classification.md).
+
 - `POST /api/jobs`: multipart form with one `file`; returns `{id, token, reused}`.
 - `GET /api/jobs/{id}`: progress, page status, queue position and worker availability.
 - `GET /api/jobs/{id}/download`: ZIP, only once every page succeeds.
@@ -61,9 +71,9 @@ scripts/deploy.sh deploy
 # With the same Compose environment selected:
 docker compose logs --tail 100 worker
 docker compose exec api python -m app.admin list
-docker compose stop worker
+docker compose stop worker classifier
 docker compose exec api python -m app.admin delete RESULT_KEY --confirm RESULT_KEY
-docker compose start worker
+docker compose start worker classifier
 ```
 
 Deletion removes all tokens that refer to that shared document. Back up the entire data directory with both services stopped, or use SQLite's online backup API plus a consistent filesystem snapshot. Never store runtime data inside an Actions checkout. See [verification](docs/verification.md) for measured acceptance evidence and remaining operational constraints.

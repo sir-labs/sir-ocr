@@ -7,6 +7,8 @@ import hashlib
 import ipaddress
 import os
 import tempfile
+import time
+import contextlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
@@ -14,7 +16,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
-from . import config as cfg, dataset, db
+from . import classification as cl, config as cfg, dataset, db
 from .artifacts import image_refs
 
 STATIC = Path(__file__).parent / 'static'
@@ -23,7 +25,17 @@ STATIC = Path(__file__).parent / 'static'
 async def lifespan(app):
     db.init()
     app.state.validation_slots = asyncio.Semaphore(2)
-    yield
+    async def sync_loop():
+        while True:
+            await asyncio.sleep(15)
+            await run_in_threadpool(cl.sweep_exports)
+    sync_task = asyncio.create_task(sync_loop())
+    try:
+        yield
+    finally:
+        sync_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sync_task
 
 app = FastAPI(title='SIR OCR', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -117,6 +129,12 @@ def bearer(request):
     auth = request.headers.get('authorization', '')
     return auth[7:] if auth.startswith('Bearer ') else ''
 
+def signed_in_owner(request):
+    # Only nginx may assert identity. A job capability alone is not a user ID.
+    if request.client and is_trusted_proxy(request.client.host):
+        return request.headers.get('x-auth-user-id','')[:200]
+    return ''
+
 def validate(path):
     try:
         result = subprocess.run(
@@ -184,7 +202,9 @@ def save_to_dataset(ident, token, owner_id):
 def get_job(ident: str, request: Request, response: Response, background: BackgroundTasks):
     token = bearer(request)
     result = db.status(ident, token)
-    owner_id = request.headers.get('x-auth-user-id', '')
+    owner_id = signed_in_owner(request)
+    if owner_id and dataset.enabled():
+        cl.register_owner(db.result_key(ident,token),owner_id)
     if result['state'] == 'completed' and owner_id and dataset.enabled():
         background.add_task(save_to_dataset, ident, token, owner_id)
     # Native file downloads cannot add an Authorization header. Grant only this
@@ -197,6 +217,64 @@ def get_job(ident: str, request: Request, response: Response, background: Backgr
     response.set_cookie('ocr_preview', token, max_age=86400, path=f'/api/jobs/{ident}/preview',
                         httponly=True, samesite='strict', secure=os.getenv('OCR_PUBLIC_ORIGIN','').startswith('https://'))
     return result
+
+@app.get('/api/jobs/{ident}/classification')
+def classification_status(ident: str, request: Request, background: BackgroundTasks):
+    key = db.result_key(ident,bearer(request))
+    cl.enqueue(key)
+    owner = signed_in_owner(request)
+    if owner and dataset.enabled():
+        cl.register_owner(key,owner)
+    result = cl.status(key,owner)
+    result['can_personalize'] = bool(owner and dataset.enabled())
+    result['storage'] = cl.export_state(key,owner) if dataset.enabled() else 'not_configured'
+    # Avoid persisting a new annotation on every per-page progress poll.
+    if owner and dataset.enabled() and (result['state'] in ('done','partial','paused') or (result['personal'] and result['personal']['review'])):
+        background.add_task(cl.sync_to_dataset,key,owner)
+    return result
+
+@app.post('/api/jobs/{ident}/classification/retry')
+def classification_retry(ident: str, request: Request):
+    key = db.result_key(ident,bearer(request))
+    with db.connect(True) as c:
+        cancelled = c.execute('SELECT 1 FROM job_cancellations WHERE job_id=?',(ident,)).fetchone()
+        if cancelled:
+            raise HTTPException(409,'งานนี้ถูกยกเลิกแล้ว')
+        c.execute("UPDATE page_classifications SET state='queued',error=NULL,updated=? WHERE result_key=? AND version=? AND state='failed'",
+                  (time.time(),key,cl.VERSION))
+    return {'state':'queued'}
+
+async def personal_request(ident,request):
+    key = db.result_key(ident,bearer(request))
+    owner = signed_in_owner(request)
+    if not owner:
+        raise HTTPException(401,'เข้าสู่ระบบเพื่อเก็บหมวดและปลายทางส่วนตัว')
+    if not dataset.enabled():
+        raise HTTPException(503,'ยังไม่ได้เชื่อมต่อคลังข้อมูลส่วนตัว')
+    raw = await request.body()
+    if len(raw)>20000:
+        raise HTTPException(413,'ข้อมูลหมวดมีขนาดใหญ่เกินไป')
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        raise HTTPException(422,'JSON ไม่ถูกต้อง')
+    if not isinstance(payload,dict):
+        raise HTTPException(422,'JSON ต้องเป็น object')
+    return key,owner,payload
+
+@app.post('/api/jobs/{ident}/classification/folders',status_code=202)
+async def classification_folders(ident: str, request: Request):
+    key,owner,payload = await personal_request(ident,request)
+    await run_in_threadpool(cl.queue_personal,key,owner,payload.get('folders'))
+    await run_in_threadpool(cl.enqueue,key)
+    return {'state':'queued'}
+
+@app.post('/api/jobs/{ident}/classification/review')
+async def classification_review(ident: str, request: Request, background: BackgroundTasks):
+    key,owner,payload = await personal_request(ident,request)
+    saved = await run_in_threadpool(cl.review,key,owner,payload)
+    background.add_task(cl.sync_to_dataset,key,owner)
+    return {'review':saved,'storage':'pending'}
 
 @app.post('/api/jobs/{ident}/retry')
 def retry_job(ident: str, request: Request):

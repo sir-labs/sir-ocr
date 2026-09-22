@@ -64,6 +64,8 @@ def init():
         CREATE INDEX IF NOT EXISTS requests_at ON requests(at);
         CREATE TABLE IF NOT EXISTS worker (id INTEGER PRIMARY KEY CHECK(id=1), heartbeat REAL NOT NULL);
         ''')
+        from . import classification
+        classification.init(c)
 
 def record_event(c, key, code, page=None, seconds=None):
     c.execute('INSERT INTO events(result_key,at,code,page,seconds) VALUES (?,?,?,?,?)',

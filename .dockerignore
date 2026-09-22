@@ -3,6 +3,7 @@
 !app/**
 !requirements-api.lock
 !requirements-worker.lock
+!requirements-classifier.lock
 !Dockerfile
 **/__pycache__
 **/*.pyc

@@ -161,6 +161,12 @@ def complete_page(key,n,meta):
             db.record_event(c,key,'page_done',n,meta['seconds'])
         c.execute("UPDATE pages SET state='done',seconds=?,error=NULL WHERE result_key=? AND number=?",(meta['seconds'],key,n))
         c.execute('UPDATE results SET model_hashes=?,updated=? WHERE key=?',(json.dumps(meta['model_hashes'],sort_keys=True),time.time(),key))
+    try:
+        from .classification import enqueue
+        enqueue(key)
+    except Exception:
+        # Enrichment is optional: the completed OCR page remains successful.
+        log.warning('classification_enqueue_failed page=%s',n)
 
 def process_job(row,engine):
     try:

@@ -108,5 +108,37 @@ services:
     logging:
       driver: json-file
       options: {max-size: 10m, max-file: '3'}
+  classifier:
+    image: sir-ocr-classifier:${OCR_IMAGE_TAG:-latest}
+    build:
+      context: .
+      target: classifier
+    user: "${OCR_UID:-1000}:${OCR_GID:-1000}"
+    environment:
+      OCR_DATA_DIR: /data
+      HF_HOME: /cache/huggingface
+      CLASSIFIER_THREADS: '4'
+    volumes:
+      - ${OCR_DATA_DIR:-./data}:/data
+      - ${OCR_AUX_CACHE:-./cache/aux}:/cache
+    depends_on:
+      api:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+    mem_limit: 8g
+    cpus: 4
+    pids_limit: 256
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, python, -m, app.classifier_health]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: '3'}
 volumes:
   rabbitmq:

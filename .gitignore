@@ -10,3 +10,4 @@ evidence-private/
 *.safetensors
 *.pdiparams
 *.zip
+.venv-classifier/

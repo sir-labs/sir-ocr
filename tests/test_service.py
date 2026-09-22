@@ -18,6 +18,158 @@ from starlette.requests import Request
 REAL_PUBLISH=broker.publish
 PUBLISHED=[]
 
+from app import classification as cl, classifier_worker
+
+
+class FakeClassifier:
+    def classify(self,text):
+        labels={'document_type':'lecture','topic':'algorithms','page_role':'proof'}
+        return {kind:{'label':labels[kind],'probabilities':{k:float(k==labels[kind]) for k in options},
+                      'confidence':1,'abstain':0} for kind,options in cl.CATALOG.items()}
+
+    def map_folders(self,text,folders):
+        return {'path':folders[0]['path'],'probabilities':{folders[0]['path']:1}}
+
+
+def test_classification_after_each_page_and_no_ocr_dependency(client):
+    job=submit(client,pdf(pages=2)).json()
+    row=result_row(job)
+    process_job(row,FakeEngine())
+    url=f"/api/jobs/{job['id']}/classification"
+    assert client.get(url).status_code==404
+    assert client.get(url,headers=headers(job)).json()['counts']['queued']==2
+    assert classifier_worker.process_one(FakeClassifier())
+    state=client.get(url,headers=headers(job)).json()
+    assert state['counts']['done']==1
+    assert state['pages'][0]['prediction']['page_role']['label']=='proof'
+    assert state['summary']['topic']['label']=='algorithms'
+    assert client.get(f"/api/jobs/{job['id']}/download",headers=headers(job)).status_code==200
+    assert classifier_worker.process_one(FakeClassifier())
+    assert client.get(url,headers=headers(job)).json()['state']=='done'
+    cl.enqueue(row['key'])
+    assert not classifier_worker.process_one(FakeClassifier())
+
+
+def test_classifier_failure_retry_preserves_ocr(client):
+    job=submit(client).json();row=result_row(job)
+    process_job(row,FakeEngine())
+    class Broken:
+        def classify(self,text): raise RuntimeError('failed')
+    classifier_worker.process_one(Broken())
+    assert result_row(job)['state']=='completed'
+    assert cl.status(row['key'])['counts']['failed']==1
+    assert client.post(f"/api/jobs/{job['id']}/classification/retry",headers=headers(job)).status_code==200
+    classifier_worker.process_one(FakeClassifier())
+    assert cl.status(row['key'])['counts']['done']==1
+
+
+def test_enqueue_failure_does_not_fail_ocr(client,monkeypatch):
+    job=submit(client).json()
+    monkeypatch.setattr(cl,'enqueue',lambda _:(_ for _ in ()).throw(RuntimeError()))
+    process_job(result_row(job),FakeEngine())
+    assert result_row(job)['state']=='completed'
+
+
+def test_personal_classification_identity_and_isolation(client,monkeypatch):
+    from app import api as api_module
+    monkeypatch.setattr(dataset,'enabled',lambda:True)
+    monkeypatch.setattr(cl,'sync_to_dataset',lambda *args:None)
+    job=submit(client).json();key=result_row(job)['key']
+    process_job(result_row(job),FakeEngine());classifier_worker.process_one(FakeClassifier())
+    url=f"/api/jobs/{job['id']}/classification"
+    u1={**headers(job),'X-Auth-User-Id':'u1'};u2={**headers(job),'X-Auth-User-Id':'u2'}
+    body={'document_type':'lecture','topic':'algorithms','destination':'Private/Algorithms'}
+    assert client.post(url+'/review',headers=u1,json=body).status_code==401
+    monkeypatch.setattr(api_module,'is_trusted_proxy',lambda peer:peer=='testclient')
+    assert client.post(url+'/review',headers=u1,json=body).status_code==200
+    assert client.get(url,headers=u1).json()['personal']['review']['destination']=='Private/Algorithms'
+    assert client.get(url,headers=u2).json()['personal'] is None
+    assert client.get(url,headers=headers(job)).json()['personal'] is None
+    folders={'folders':[{'path':'Private/Algorithms','description':'algorithms'}]}
+    assert client.post(url+'/folders',headers=u1,json=folders).status_code==202
+    classifier_worker.process_mapping(FakeClassifier())
+    assert cl.status(key,'u1')['personal']['suggestion']['path']=='Private/Algorithms'
+    assert cl.status(key,'u2')['personal'] is None
+
+
+def test_classification_validation(client,monkeypatch):
+    from app import api as api_module
+    monkeypatch.setattr(api_module,'is_trusted_proxy',lambda peer:peer=='testclient')
+    monkeypatch.setattr(dataset,'enabled',lambda:True)
+    job=submit(client).json();auth={**headers(job),'X-Auth-User-Id':'u1'}
+    url=f"/api/jobs/{job['id']}/classification"
+    for path in ['../../escape','/absolute','__none__','file://x','bad\npath']:
+        assert client.post(url+'/folders',headers=auth,json={'folders':[{'path':path}]}).status_code==422
+    assert client.post(url+'/review',headers=auth,json={'document_type':'injected','topic':'algorithms'}).status_code==422
+    assert client.post(url+'/folders',headers=auth,json=[]).status_code==422
+
+
+def test_stale_mapping_cannot_overwrite_new_request(client):
+    job=submit(client).json();key=result_row(job)['key']
+    process_job(result_row(job),FakeEngine());classifier_worker.process_one(FakeClassifier())
+    cl.queue_personal(key,'u1',[{'path':'Old'}])
+    class Slow(FakeClassifier):
+        def map_folders(self,text,folders):
+            cl.queue_personal(key,'u1',[{'path':'New'}])
+            return super().map_folders(text,folders)
+    classifier_worker.process_mapping(Slow())
+    data=cl.status(key,'u1')['personal']
+    assert data['state']=='queued' and data['suggestion'] is None
+    classifier_worker.process_mapping(FakeClassifier())
+    assert cl.status(key,'u1')['personal']['suggestion']['path']=='New'
+
+
+def test_classification_central_export_retries_and_is_per_owner(client,monkeypatch):
+    job=submit(client).json();key=result_row(job)['key']
+    process_job(result_row(job),FakeEngine());classifier_worker.process_one(FakeClassifier())
+    attempts=[]
+    monkeypatch.setattr(dataset,'source_item',lambda owner,*args:{'id':11 if owner=='u1' else 22})
+    def annotate(owner,item,kind,payload):
+        attempts.append((owner,item))
+        if len(attempts)==1: raise RuntimeError('offline')
+    monkeypatch.setattr(dataset,'_annotate',annotate)
+    cl.sync_to_dataset(key,'u1');assert cl.export_state(key,'u1')=='pending'
+    cl.sync_to_dataset(key,'u1');assert cl.export_state(key,'u1')=='saved'
+    cl.sync_to_dataset(key,'u1');assert len(attempts)==2
+    cl.sync_to_dataset(key,'u2');assert attempts[-1]==('u2',22)
+    cl.review(key,'u1',{'document_type':'lecture','topic':'algorithms','destination':'My/Folder'})
+    assert cl.export_state(key,'u1')=='pending'
+    assert cl.export_state(key,'u2')=='saved'
+
+
+def test_export_sweep_finishes_after_browser_closed(client,monkeypatch):
+    job=submit(client).json();key=result_row(job)['key']
+    cl.register_owner(key,'u1')  # verified user was present while OCR was still running
+    monkeypatch.setattr(dataset,'enabled',lambda:True)
+    pushes=[];annotations=[]
+    monkeypatch.setattr(dataset,'push_result',lambda *args:pushes.append(args[0]))
+    monkeypatch.setattr(dataset,'source_item',lambda *args:{'id':11})
+    monkeypatch.setattr(dataset,'_annotate',lambda *args:annotations.append(args))
+    process_job(result_row(job),FakeEngine());classifier_worker.process_one(FakeClassifier())
+    cl.sweep_exports();cl.sweep_exports()
+    assert pushes==['u1'] and len(annotations)==1
+    assert cl.export_state(key,'u1')=='saved'
+
+
+def test_untrusted_identity_cannot_push_document(client,monkeypatch):
+    monkeypatch.setattr(dataset,'enabled',lambda:True)
+    pushes=[]
+    monkeypatch.setattr(dataset,'push_result',lambda *args:pushes.append(args))
+    job=submit(client).json();process_job(result_row(job),FakeEngine())
+    response=client.get(f"/api/jobs/{job['id']}",headers={**headers(job),'X-Auth-User-Id':'forged'})
+    assert response.status_code==200 and pushes==[]
+
+
+def test_cancelled_document_has_paused_classification(client):
+    job=submit(client,pdf(pages=2)).json();key=result_row(job)['key']
+    # A completed page may coexist with a cancelled remainder.
+    with db.connect(True) as c:
+        c.execute("UPDATE pages SET state='done' WHERE result_key=? AND number=1",(key,))
+    cl.enqueue(key)
+    client.post(f"/api/jobs/{job['id']}/cancel",headers=headers(job))
+    assert cl.status(key)['state']=='paused'
+    assert not classifier_worker.process_one(FakeClassifier())
+
 @pytest.fixture
 def client(tmp_path,monkeypatch):
     monkeypatch.setattr(cfg,'DATA',tmp_path)
@@ -93,6 +245,8 @@ def test_upload_token_zip_and_reuse(client):
     assert 'token' not in (cfg.DATA/'results'/row['key']/'manifest.json').read_text().replace('max_new_tokens','')
 
 def test_completed_job_is_pushed_to_the_dataset_once_per_user(client,monkeypatch):
+    from app import api as api_module
+    monkeypatch.setattr(api_module,'is_trusted_proxy',lambda peer:peer=='testclient')
     pushes=[]
     monkeypatch.setattr(dataset,'enabled',lambda:True)
     monkeypatch.setattr(dataset,'push_result',lambda owner,key,base:pushes.append((owner,key,base)))
@@ -117,6 +271,8 @@ def test_completed_job_is_pushed_to_the_dataset_once_per_user(client,monkeypatch
 
 
 def test_a_failed_push_is_retried_on_the_next_poll(client,monkeypatch):
+    from app import api as api_module
+    monkeypatch.setattr(api_module,'is_trusted_proxy',lambda peer:peer=='testclient')
     monkeypatch.setattr(dataset,'enabled',lambda:True)
     attempts=[]
     def flaky(owner,key,base):

@@ -1,0 +1,4 @@
+-r requirements-api.in
+torch==2.14.0+cpu
+transformers==5.17.0
+openthai-systemone @ git+https://github.com/iapp-technology/openthai-systemone.git@5d04bcca0c58bd10e7dac2d3d369d8f760bea6cf
